@@ -1,0 +1,3332 @@
+"""
+Python Journey - Desktop Edition
+Learn Python. Pass quizzes. Win badges.
+
+A CustomTkinter desktop version of the original console program. Every
+lesson, quiz question, scoring rule, rank, and certificate text from the
+original code are preserved.
+
+NEW in this version
+  * Real PDF certificate (landscape A4) drawn with ReportLab
+  * "Save as PDF" with a Save As dialog
+  * Gmail delivery with the PDF attached
+      - Gmail API + OAuth 2.0 (default, no password needed), or
+      - the original Google App Password (SMTP) login, still supported
+  * Delivery status chips: PDF Generated / PDF Saved / Email Sent
+
+NEW in the Accounts edition
+  * User accounts (sign in / create account) stored in SQLite, with
+    PBKDF2-SHA256 salted password hashing (no plain-text passwords)
+  * Automatic saving: opening a lesson, every quiz attempt, passing a lesson,
+    badges, ranks, certificate eligibility and delivery are saved instantly
+  * Lesson status indicators: Not Started (gray), In Progress (blue), Completed (green)
+    and an overall progress bar
+  * Profile page (picture, name, @username, bio, stats, achievements, activity)
+  * Edit Profile, circular profile pictures (PNG/JPG/JPEG) with preview
+  * Account Settings: personal info, picture, password, logout, delete account
+
+Run:      python python_journey.py
+Requires: pip install customtkinter pillow reportlab
+Data:     ~/.python_journey/python_journey.db  and  ~/.python_journey/avatars/
+          (set the PYTHON_JOURNEY_HOME environment variable to use another folder)
+"""
+
+import os
+import io
+import re
+import sys
+import hmac
+import base64
+import shutil
+import sqlite3
+import hashlib
+import secrets
+import datetime
+import functools
+import smtplib
+import tempfile
+import threading
+import webbrowser
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, filedialog
+from email.message import EmailMessage
+from xml.sax.saxutils import escape as xml_escape
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    print("CustomTkinter is not installed.")
+    print("Install it with:  pip install customtkinter")
+    sys.exit(1)
+
+# ReportLab is needed only for the PDF features. The rest of the app runs without it.
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen import canvas as pdf_canvas
+    from reportlab.platypus import Paragraph
+    REPORTLAB_OK = True
+except ImportError:
+    REPORTLAB_OK = False
+
+# Pillow is needed only for profile pictures. Without it the app shows initials avatars.
+try:
+    from PIL import Image, ImageDraw, ImageOps
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+
+# =====================================================================
+#  THEME
+# =====================================================================
+
+C = {
+    "bg": "#0B1220",
+    "sidebar": "#0F172A",
+    "surface": "#121B2E",
+    "card": "#162036",
+    "card_hover": "#1D2A44",
+    "border": "#24324D",
+    "code_bg": "#0A0F1A",
+    "text": "#E6EDF7",
+    "text_soft": "#C3CEDF",
+    "muted": "#8A9BB8",
+    "primary": "#3B82F6",
+    "primary_hover": "#2563EB",
+    "primary_soft": "#16284A",
+    "primary_text": "#93C5FD",
+    "accent": "#FACC15",
+    "accent_hover": "#EAB308",
+    "success": "#22C55E",
+    "success_soft": "#0F2A1C",
+    "output": "#86EFAC",
+    "error": "#F87171",
+    "error_soft": "#2A1215",
+    "cert_bg": "#FBF7EC",
+    "cert_gold": "#C9A227",
+    "cert_text": "#1F2937",
+    "cert_name": "#1E3A8A",
+}
+
+if sys.platform.startswith("win"):
+    FONT_FAMILIES = {"ui": "Segoe UI", "mono": "Consolas", "serif": "Georgia"}
+elif sys.platform == "darwin":
+    FONT_FAMILIES = {"ui": "Helvetica Neue", "mono": "Menlo", "serif": "Georgia"}
+else:
+    FONT_FAMILIES = {"ui": "DejaVu Sans", "mono": "DejaVu Sans Mono", "serif": "DejaVu Serif"}
+
+APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
+GMAIL_SENDER_ENV = "PYTHON_JOURNEY_GMAIL_ADDRESS"
+GMAIL_APP_PASSWORD_ENV = "PYTHON_JOURNEY_GMAIL_APP_PASSWORD"
+
+# Gmail API (OAuth 2.0). Only the "send" permission is requested.
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+CONFIG_DIR = Path.home() / ".python_journey"
+TOKEN_FILE = CONFIG_DIR / "gmail_token.json"          # created after the first Google sign-in
+CLIENT_SECRET_FILE = CONFIG_DIR / "credentials.json"  # the OAuth client file YOU download from Google Cloud
+
+# Accounts, progress and profile pictures live here (SQLite database + avatars folder).
+DATA_DIR = Path(os.environ.get("PYTHON_JOURNEY_HOME") or CONFIG_DIR)
+DB_FILE = DATA_DIR / "python_journey.db"
+
+
+# =====================================================================
+#  CERTIFICATE TEXT (original wording preserved)
+# =====================================================================
+
+def certificate_email_body(name):
+    return (
+        "CERTIFICATE OF COMPLETION\n\n"
+        "Proudly presented to\n"
+        + name
+        + "\n\n"
+          "This certificate is awarded in recognition of exceptional dedication, resilience, and outstanding\n"
+          "achievement in mastering the core fundamentals of programming. Throughout the ACT\n"
+          "Python Quest, "
+        + name
+        + " successfully navigated through rigorous coding challenges, complex logic\n"
+          "structures, and hands-on debugging sessions across all seven comprehensive lessons—from\n"
+          "basic syntax and conditional statements to loops and automated scripts.\n\n"
+          "Beyond simply completing the coursework, this journey represents a true transformation in\n"
+          "problem-solving ability and technical proficiency. By building and refining interactive\n"
+          "applications, managing dynamic data using lists, and implementing clean control flows, "
+        + name
+        + "\nhas demonstrated the analytical mindset of a true software creator and developer.\n\n"
+          "Having conquered every obstacle and earned the highest rank within the quest, "
+        + name
+        + " is hereby\n"
+          "officially recognized and certified as a PYTHON MASTER. May this milestone serve as a strong\n"
+          "foundation for even greater technological innovations and future coding triumphs!"
+    )
+
+
+def certificate_paragraphs(player):
+    return [
+        "This certificate is awarded in recognition of exceptional dedication, resilience, and "
+        "outstanding achievement in mastering the core fundamentals of programming. Throughout the "
+        f"ACT102 Python Quest, {player} successfully navigated through rigorous coding challenges, "
+        "complex logic structures, and hands-on debugging sessions across all seven comprehensive "
+        "lessons—from basic syntax and conditional statements to loops and automated scripts.",
+
+        "Beyond simply completing the coursework, this journey represents a true transformation "
+        "in problem-solving ability and technical proficiency. By building and refining interactive "
+        "applications, managing dynamic data using lists, and implementing clean control flows, "
+        f"{player} has demonstrated the analytical mindset of a true software creator and developer.",
+
+        f"Having conquered every obstacle and earned the highest rank within the quest, {player} "
+        "is hereby officially recognized and certified as a PYTHON MASTER. May this milestone "
+        "serve as a strong foundation for even greater technological innovations and future "
+        "coding triumphs!",
+    ]
+
+
+def certificate_text(player):
+    border = "*" * 64
+    body = "\n\n".join(certificate_paragraphs(player))
+    return (
+        f"{border}\n"
+        f"{'CERTIFICATE OF COMPLETION':^64}\n"
+        f"{border}\n\n"
+        f"Proudly presented to\n{player}\n\n"
+        f"{body}\n"
+    )
+
+
+def certificate_details(rank, passed, total, issued=None):
+    """The three footer values shown on both the preview and the PDF."""
+    issued = issued or datetime.date.today()
+    return [("RANK", rank),
+            ("LESSONS", f"{passed} of {total} passed"),
+            ("ISSUED", issued.strftime("%B %d, %Y"))]
+
+
+def certificate_filename(player):
+    safe = "".join(ch for ch in player if ch.isalnum() or ch in " _-").strip()
+    safe = "_".join(safe.split()) or "Player"
+    return f"Python_Journey_Certificate_{safe}.pdf"
+
+
+# =====================================================================
+#  PDF CERTIFICATE (drawn with ReportLab, nothing is an image)
+# =====================================================================
+
+def build_certificate_pdf(player, rank, passed, total, issued=None):
+    """Return the certificate as PDF bytes (landscape A4). Every element is drawn from data."""
+    if not REPORTLAB_OK:
+        raise RuntimeError("ReportLab is not installed. Run:  pip install reportlab")
+
+    cream, gold = HexColor(C["cert_bg"]), HexColor(C["cert_gold"])
+    ink, name_color, soft, grey = (HexColor(C["cert_text"]), HexColor(C["cert_name"]),
+                                   HexColor("#374151"), HexColor("#6B7280"))
+
+    buffer = io.BytesIO()
+    page_w, page_h = landscape(A4)
+    pdf = pdf_canvas.Canvas(buffer, pagesize=(page_w, page_h))
+    pdf.setTitle("Python Journey Certificate")
+    pdf.setAuthor("Python Journey")
+    pdf.setSubject("Certificate of Completion")
+
+    # Cream paper
+    pdf.setFillColor(cream)
+    pdf.rect(0, 0, page_w, page_h, stroke=0, fill=1)
+
+    # Gold double border
+    pdf.setStrokeColor(gold)
+    pdf.setLineWidth(3.5)
+    pdf.rect(22, 22, page_w - 44, page_h - 44, stroke=1, fill=0)
+    pdf.setLineWidth(1)
+    pdf.rect(32, 32, page_w - 64, page_h - 64, stroke=1, fill=0)
+
+    # Small gold corner squares
+    pdf.setFillColor(gold)
+    for cx in (22, page_w - 22):
+        for cy in (22, page_h - 22):
+            pdf.rect(cx - 4, cy - 4, 8, 8, stroke=0, fill=1)
+
+    centre = page_w / 2
+    top = page_h
+
+    pdf.setFillColor(gold)
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawCentredString(centre, top - 74, "ACT102   ·   PYTHON QUEST")
+
+    pdf.setFillColor(ink)
+    pdf.setFont("Times-Bold", 32)
+    pdf.drawCentredString(centre, top - 112, "CERTIFICATE OF COMPLETION")
+
+    pdf.setFillColor(grey)
+    pdf.setFont("Times-Italic", 14)
+    pdf.drawCentredString(centre, top - 140, "Proudly presented to")
+
+    # Recipient name, shrunk if very long so it always fits
+    size = 36
+    while size > 16 and stringWidth(player, "Times-Bold", size) > page_w - 160:
+        size -= 1
+    pdf.setFillColor(name_color)
+    pdf.setFont("Times-Bold", size)
+    pdf.drawCentredString(centre, top - 184, player)
+
+    pdf.setStrokeColor(gold)
+    pdf.setLineWidth(1.5)
+    pdf.line(centre - 120, top - 198, centre + 120, top - 198)
+
+    # Body paragraphs
+    style = ParagraphStyle("body", fontName="Times-Roman", fontSize=11.5, leading=16,
+                           textColor=soft, alignment=TA_CENTER)
+    body_w = page_w - 190
+    y = top - 220
+    for text in certificate_paragraphs(player):
+        paragraph = Paragraph(xml_escape(text), style)
+        _, height = paragraph.wrapOn(pdf, body_w, page_h)
+        y -= height
+        paragraph.drawOn(pdf, (page_w - body_w) / 2, y)
+        y -= 11
+
+    # Footer: rank / lessons / issued
+    details = certificate_details(rank, passed, total, issued)
+    column_w = (page_w - 190) / 3
+    for i, (caption, value) in enumerate(details):
+        x = (page_w - body_w) / 2 + column_w * i + column_w / 2
+        pdf.setFillColor(gold)
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawCentredString(x, 92, caption)
+        pdf.setFillColor(ink)
+        pdf.setFont("Times-Bold", 14)
+        pdf.drawCentredString(x, 74, value)
+
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+# =====================================================================
+#  EMAIL
+# =====================================================================
+
+def gmail_login(address, password):
+    """Connect to the configured sender Gmail using an App Password and STARTTLS."""
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=25)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(address, password)
+        return server
+    except smtplib.SMTPAuthenticationError:
+        try:
+            server.quit()
+        except Exception:
+            pass
+        return "wrong"
+    except (OSError, smtplib.SMTPException):
+        try:
+            server.quit()
+        except Exception:
+            pass
+        return "offline"
+
+
+def get_gmail_sender_config():
+    """Read the app-wide sender credentials from environment variables."""
+    address = os.environ.get(GMAIL_SENDER_ENV, "").strip()
+    app_password = os.environ.get(GMAIL_APP_PASSWORD_ENV, "").replace(" ", "").strip()
+    return address, app_password
+
+
+def build_certificate_email(sender, recipient, name, pdf_bytes, filename):
+    """Build the certificate email and attach the generated PDF."""
+    mail = EmailMessage()
+    mail["Subject"] = "Your Python Quest Certificate"
+    mail["From"] = sender
+    mail["To"] = recipient
+    mail.set_content(certificate_email_body(name))
+    mail.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
+    return mail
+
+
+def send_certificate(sender_address, app_password, recipient, name, pdf_bytes, filename):
+    """Send a learner's certificate from the centrally configured Gmail sender."""
+    if not sender_address or not app_password:
+        return False, (
+            "Gmail sender is not configured. Set PYTHON_JOURNEY_GMAIL_ADDRESS and "
+            "PYTHON_JOURNEY_GMAIL_APP_PASSWORD in your Windows environment variables."
+        )
+    server = gmail_login(sender_address, app_password)
+    if server == "wrong":
+        return False, "Gmail authentication failed. Check the sender address and App Password."
+    if server == "offline":
+        return False, "Could not connect to Gmail. Check your internet connection."
+    mail = build_certificate_email(sender_address, recipient, name, pdf_bytes, filename)
+    try:
+        refused = server.send_message(mail)
+        if refused:
+            return False, f"Gmail refused one or more recipients: {', '.join(refused.keys())}"
+    except Exception as exc:
+        return False, f"Gmail did not accept the message ({type(exc).__name__}: {exc})."
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return True, f"Certificate PDF accepted by Gmail for {recipient}."
+
+
+def test_gmail_connection():
+    """Authenticate with Gmail without sending an email."""
+    address, app_password = get_gmail_sender_config()
+    if not address or not app_password:
+        return False, (
+            "Gmail is not configured. Set PYTHON_JOURNEY_GMAIL_ADDRESS and "
+            "PYTHON_JOURNEY_GMAIL_APP_PASSWORD in Windows environment variables."
+        )
+    try:
+        clean_email(address)
+    except ValidationError:
+        return False, "The configured sender Gmail address is not valid."
+    server = gmail_login(address, app_password)
+    if server == "wrong":
+        return False, "Gmail authentication failed. Check the App Password."
+    if server == "offline":
+        return False, "Could not connect to Gmail. Check your internet connection."
+    try:
+        server.noop()
+    except Exception as exc:
+        return False, f"Gmail connection test failed ({type(exc).__name__}: {exc})."
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return True, f"Connected to Gmail as {address}. No email was sent."
+
+
+def find_client_secret():
+    """Look for the OAuth client file you downloaded from Google Cloud. Nothing is hardcoded."""
+    candidates = [os.environ.get("PYTHON_JOURNEY_CLIENT_SECRET", ""),
+                  str(CLIENT_SECRET_FILE),
+                  str(Path.cwd() / "credentials.json"),
+                  str(Path(__file__).resolve().parent / "credentials.json")]
+    for path in candidates:
+        if path and Path(path).is_file():
+            return path
+    return None
+
+
+def gmail_api_send(address, name, pdf_bytes, filename, client_secret_path):
+    """Gmail API + OAuth 2.0 flow. Returns (sent, message). Opens the browser the first time only."""
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
+    except ImportError:
+        return False, ("Gmail API libraries are missing. Run:  pip install google-api-python-client "
+                       "google-auth-oauthlib google-auth-httplib2")
+    try:
+        creds = None
+        if TOKEN_FILE.is_file():
+            try:
+                creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), GMAIL_SCOPES)
+            except Exception:
+                creds = None
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0, prompt="consent")
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        try:
+            os.chmod(TOKEN_FILE, 0o600)
+        except OSError:
+            pass
+
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        # "me" is whichever Google account signed in; the mail is addressed to the registered email.
+        mail = build_certificate_email("me", address, name, pdf_bytes, filename)
+        raw = base64.urlsafe_b64encode(mail.as_bytes()).decode()
+        response = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        if not response.get("id"):
+            return False, "Gmail did not confirm the message."
+    except HttpError as exc:
+        return False, f"Gmail API error: {getattr(exc, 'reason', exc)}"
+    except Exception as exc:
+        return False, f"Could not send through Gmail ({exc})."
+    return True, "Certificate PDF sent! Check your inbox (and the Spam folder)."
+
+
+# =====================================================================
+#  LESSON CONTENT
+#  Quiz answers use the same values the original accepted. For multiple
+#  choice questions the option number ("1", "2", "3") is the answer.
+# =====================================================================
+
+def age_category(age):
+    if age < 0 or age > 100:
+        return "Invalid input"
+    elif age <= 12:
+        return "Category: Child"
+    elif age <= 19:
+        return "Category: Teenager"
+    elif age <= 59:
+        return "Category: Adult"
+    else:
+        return "Category: Senior Citizen"
+
+
+def lines(values):
+    return "\n".join(str(v) for v in values)
+
+
+LESSONS = [
+    {
+        "title": "Introduction to Programming",
+        "summary": "What Python is, who created it, and why it is worth learning.",
+        "blocks": [
+            {"type": "h", "text": "What is Python programming?"},
+            {"type": "p", "text": "Python is a widely-used and popular programming language."},
+            {"type": "h", "text": "Who created Python?"},
+            {"type": "p", "text": "Python was created by Guido van Rossum in 1991 — a Dutch software "
+                                  "engineer best known for creating the Python programming language."},
+            {"type": "h", "text": "What was his motive for creating Python?"},
+            {"type": "p", "text": "He designed Python with the goal of making programming simple, "
+                                  "readable, and easy to learn, while remaining powerful enough for "
+                                  "professional software development."},
+            {"type": "h", "text": "Why learn Python?"},
+            {"type": "bullets", "items": [
+                "Simple and easy to learn",
+                "Readable syntax (almost like plain English)",
+                "Versatile (AI, web, automation, data science, games)",
+                "Huge community",
+            ]},
+            {"type": "h", "text": "Tools"},
+            {"type": "bullets", "items": ["PyCharm", "Visual Studio Code (VS Code)", "Jupyter Notebook"]},
+        ],
+        "quiz": [
+            {"prompt": "Who created Python?",
+             "options": ["Bill Gates", "Guido van Rossum", "Steve Jobs"], "answer": ("2",)},
+            {"prompt": "When was Python created?",
+             "options": ["1991", "1992", "1993"], "answer": ("1",)},
+            {"prompt": "What motive did Guido van Rossum give for creating Python?",
+             "options": ["To make the syntax harder and complicated.",
+                         "To make Python unique from other programming languages.",
+                         "To make programming simple, readable, and easy to learn."],
+             "answer": ("3",)},
+        ],
+    },
+    {
+        "title": "Python Basic Syntax",
+        "summary": "Case-sensitivity, indentation, print() and comments.",
+        "blocks": [
+            {"type": "p", "text": "Syntax = the rules for writing a program correctly."},
+            {"type": "h", "text": "RULE 1 — Python is case-sensitive"},
+            {"type": "p", "text": "Name and name are two different identifiers."},
+            {"type": "code", "code": 'Name = "Maria"\nname = "Juan"\nprint(Name)\nprint(name)',
+             "output": "Maria\nJuan"},
+            {"type": "h", "text": "RULE 2 — Python uses indentation"},
+            {"type": "p", "text": "Python uses indentation, not curly braces, to define blocks such "
+                                  "as the inside of an if statement."},
+            {"type": "code", "label": "CORRECT", "tone": "good",
+             "code": 'age = 18\nif age >= 18:\n    print("Adult")', "output": "Adult"},
+            {"type": "code", "label": "WRONG", "tone": "bad",
+             "code": 'age = 18\nif age >= 18:\nprint("Adult")',
+             "output": "IndentationError: expected an indented block"},
+            {"type": "h", "text": "Printing with print()"},
+            {"type": "p", "text": "print() shows information on the screen. Strings need quotes. "
+                                  "Numbers can be printed directly."},
+            {"type": "code", "code": 'print("Hello, World!")\nprint(100)',
+             "output": "Hello, World!\n100"},
+            {"type": "h", "text": "COMMENTS"},
+            {"type": "p", "text": "Python ignores comments. Use them to explain your code."},
+            {"type": "code", "label": "SINGLE-LINE AND MULTI-LINE",
+             "code": '# This is a comment\n""" This is a multi-line comment """'},
+        ],
+        "quiz": [
+            {"prompt": "Are Name and name the same thing in Python?",
+             "options": ["Yes", "No"], "answer": ("2",), "hint": "see RULE 1 (case-sensitive)."},
+            {"prompt": "Type the symbol that starts a single-line comment.",
+             "answer": ("#",), "hint": "see the COMMENTS part of the lesson.",
+             "placeholder": "Type one symbol"},
+            {"prompt": "What does Python use to define code blocks?",
+             "options": ["Semicolons", "Indentation", "Curly braces"],
+             "answer": ("2",), "hint": "see RULE 2."},
+        ],
+    },
+    {
+        "title": "Variables and Data Types",
+        "summary": "Storing data with int, float, str and bool, plus naming rules.",
+        "blocks": [
+            {"type": "p", "text": "A variable is a named storage location that holds data. "
+                                  "The value inside a variable can change."},
+            {"type": "h", "text": "Data types"},
+            {"type": "table", "headers": ["Type", "Meaning", "Example"], "mono": {0, 2},
+             "rows": [["int", "whole numbers", "age = 20"],
+                      ["float", "numbers with a decimal", "grade = 89.5"],
+                      ["str", "text inside quotes", 'name = "Maria"'],
+                      ["bool", "True or False", "is_enrolled = True"]]},
+            {"type": "h", "text": "Running those four lines"},
+            {"type": "code",
+             "code": 'age = 20\ngrade = 89.5\nname = "Maria"\nis_enrolled = True\n'
+                     'print(age)\nprint(grade)\nprint(name)\nprint(is_enrolled)',
+             "output": lines([20, 89.5, "Maria", True])},
+            {"type": "h", "text": "Variable naming rules"},
+            {"type": "bullets", "items": [
+                "Must start with a letter or an underscore (_value)",
+                "Cannot start with a number (1number is invalid)",
+                "Cannot contain spaces or special characters like @ # $ %",
+            ]},
+        ],
+        "quiz_note": "Type data types in small letters: int, float, str or bool.",
+        "quiz": [
+            {"prompt": "Which variable name is valid?",
+             "options": ["1number", "my name", "_value"], "answer": ("3",),
+             "hint": "see 'Variable naming rules'."},
+            {"prompt": "What is the data type in this line?", "code": "grade = 89.5",
+             "answer": ("float",), "hint": "it has a decimal point.",
+             "placeholder": "int, float, str or bool"},
+            {"prompt": "What is the data type in this line?", "code": "is_enrolled = True",
+             "answer": ("bool",), "hint": "True and False are special values.",
+             "placeholder": "int, float, str or bool"},
+            {"prompt": "What is the data type in this line?", "code": 'name = "Maria"',
+             "answer": ("str",), "hint": "it is text inside quotes.",
+             "placeholder": "int, float, str or bool"},
+        ],
+    },
+    {
+        "title": "Arithmetic Operators",
+        "summary": "Math in Python and the PEMDAS order of operations.",
+        "blocks": [
+            {"type": "h", "text": "Operators"},
+            {"type": "table", "headers": ["Operator", "Operation", "Example", "Result"],
+             "mono": {0, 2, 3},
+             "rows": [["+", "Addition", "5 + 3", str(5 + 3)],
+                      ["-", "Subtraction", "10 - 4", str(10 - 4)],
+                      ["*", "Multiplication", "7 * 2", str(7 * 2)],
+                      ["/", "Division (float)", "15 / 3", str(15 / 3)],
+                      ["//", "Floor division", "17 // 3", str(17 // 3)],
+                      ["%", "Modulus (remainder)", "10 % 3", str(10 % 3)],
+                      ["**", "Exponent (power)", "2 ** 3", str(2 ** 3)]]},
+            {"type": "h", "text": "Order of operations (PEMDAS)"},
+            {"type": "p", "text": "Python follows PEMDAS: Parentheses, Exponents, "
+                                  "Multiplication/Division, Addition/Subtraction."},
+            {"type": "code", "code": "print(2 + 3 * 4)\nprint((2 + 3) * 4)",
+             "output": lines([2 + 3 * 4, (2 + 3) * 4])},
+        ],
+        "quiz_note": "Type just the answer, like 7.",
+        "quiz": [
+            {"prompt": "What is the result?", "code": "17 // 3", "answer": ("5",),
+             "hint": "// is floor division (whole number only)."},
+            {"prompt": "What is the result?", "code": "10 % 3", "answer": ("1",),
+             "hint": "% gives the remainder."},
+            {"prompt": "What is the result?", "code": "2 ** 3", "answer": ("8",),
+             "hint": "** is the power: 2 * 2 * 2."},
+            {"prompt": "What is the result?", "code": "2 + 3 * 4", "answer": ("14",),
+             "hint": "PEMDAS - multiply before you add."},
+        ],
+    },
+    {
+        "title": "Basic Input and Output",
+        "summary": "Reading user input with input() and converting it.",
+        "blocks": [
+            {"type": "p", "text": "input() gets information from the user. It always gives you a "
+                                  "string (str). To do math, convert it with int() or float()."},
+            {"type": "h", "text": "The code from the lecture"},
+            {"type": "code",
+             "code": 'name = input("Enter your name: ")\n'
+                     'age = int(input("Enter your age: "))\n'
+                     'grade = float(input("Enter your final grade: "))\n'
+                     'print(f"Student: {name}, Age: {age}, Grade: {grade}")'},
+            {"type": "try"},
+        ],
+        "quiz_note": "Type your answers in small letters.",
+        "quiz": [
+            {"prompt": "What data type does input() always give you?", "answer": ("str",),
+             "hint": "by default, all input is a string.", "placeholder": "int, float or str"},
+            {"prompt": "Fill in the blank to read a whole number:",
+             "code": 'age = ____(input("Enter your age: "))', "answer": ("int",),
+             "hint": "see the age line in the lecture code."},
+            {"prompt": "Fill in the blank to read a decimal number:",
+             "code": 'grade = ____(input("Enter your final grade: "))', "answer": ("float",),
+             "hint": "see the grade line in the lecture code."},
+        ],
+    },
+    {
+        "title": "Conditions and Logic",
+        "summary": "Comparison and logical operators, and if / elif / else.",
+        "blocks": [
+            {"type": "p", "text": "Conditional statements let a program make decisions."},
+            {"type": "h", "text": "Comparison operators"},
+            {"type": "table", "headers": ["Operator", "Meaning"], "mono": {0},
+             "rows": [["==", "equal to"], ["!=", "not equal to"],
+                      [">", "greater than"], ["<", "less than"],
+                      [">=", "greater or equal"], ["<=", "less or equal"]]},
+            {"type": "h", "text": "Logical operators"},
+            {"type": "table", "headers": ["Operator", "Rule", "Example", "Result"], "mono": {0, 2, 3},
+             "rows": [["and", "True only if ALL conditions are True", "True and True", str(True and True)],
+                      ["and", "", "True and False", str(True and False)],
+                      ["or", "True if AT LEAST ONE condition is True", "False or True", str(False or True)],
+                      ["or", "", "False or False", str(False or False)],
+                      ["not", "reverses the result", "not True", str(not True)],
+                      ["not", "", "not False", str(not False)]]},
+            {"type": "h", "text": "if - elif - else (from the lecture, with age = 15)"},
+            {"type": "code",
+             "code": 'age = 15\n'
+                     'if age < 0 or age > 100:\n    print("Invalid input")\n'
+                     'elif age <= 12:\n    print("Category: Child")\n'
+                     'elif age <= 19:\n    print("Category: Teenager")\n'
+                     'elif age <= 59:\n    print("Category: Adult")\n'
+                     'else:\n    print("Category: Senior Citizen")',
+             "output": age_category(15)},
+        ],
+        "quiz": [
+            {"prompt": "Which operator means 'not equal to'?",
+             "options": ["==", "!=", ">="], "answer": ("2",), "hint": "see 'Comparison operators'."},
+            {"prompt": "What is the result?", "code": "True and False",
+             "options": ["True", "False"], "answer": ("2",),
+             "hint": "'and' needs ALL conditions to be True."},
+            {"prompt": "What is the result?", "code": "False or True",
+             "options": ["True", "False"], "answer": ("1",),
+             "hint": "'or' needs AT LEAST ONE True."},
+            {"prompt": "What is the result?", "code": "not True",
+             "options": ["True", "False"], "answer": ("2",), "hint": "'not' reverses the result."},
+            {"prompt": "With the lecture code, age = 15 gives which category?",
+             "options": ["Child", "Adult", "Teenager"], "answer": ("3",),
+             "hint": "check which 'elif' is True first."},
+        ],
+    },
+    {
+        "title": "Loops",
+        "summary": "Repeating code with for, while, range() and break.",
+        "blocks": [
+            {"type": "p", "text": "Iteration = repeating a block of code."},
+            {"type": "bullets", "items": [
+                "for loop - when you know how many times to repeat",
+                "while loop - repeats as long as its condition is True",
+            ]},
+            {"type": "h", "text": "range(start, stop, step)"},
+            {"type": "p", "text": "The stop number is NOT included."},
+            {"type": "code", "label": "NUMBERS 1 TO 5",
+             "code": "for num in range(1, 6):\n    print(num)", "output": lines(range(1, 6))},
+            {"type": "code", "label": "ODD NUMBERS 1 TO 9",
+             "code": "for num in range(1, 10, 2):\n    print(num)", "output": lines(range(1, 10, 2))},
+            {"type": "code", "label": "COUNTDOWN 5 TO 1",
+             "code": "for num in range(5, 0, -1):\n    print(num)", "output": lines(range(5, 0, -1))},
+            {"type": "h", "text": "while True and break"},
+            {"type": "p", "text": "while True runs forever until a break statement is hit. "
+                                  "The running total code from the lecture:"},
+            {"type": "code",
+             "code": 'total = 0\nwhile True:\n    num = int(input("Enter an integer (0 to stop): "))\n'
+                     '    if num == 0:\n        break\n    total += num\nprint(f"Total: {total}")'},
+        ],
+        "quiz": [
+            {"prompt": "What does this loop print?", "code": "for num in range(1, 6)",
+             "options": ["1 to 5", "1 to 6", "0 to 5"], "answer": ("1",),
+             "hint": "the stop number is not included."},
+            {"prompt": "What does this range give?", "code": "range(1, 10, 2)",
+             "options": ["2, 4, 6, 8", "1, 3, 5, 7, 9", "1 to 10"], "answer": ("2",),
+             "hint": "start at 1, then step by 2."},
+            {"prompt": "Which keyword stops a  while True  loop?", "answer": ("break",),
+             "hint": "it is in the running total code."},
+            {"prompt": "In the running total code, you type 4, then 6, then 10, then 0. "
+                       "What is the Total?", "answer": ("20",),
+             "hint": "0 stops the loop and is not added."},
+            {"prompt": "Type the range() that counts down from 10 to 1.",
+             "answer": ("range(10, 0, -1)", "range(10,0,-1)"),
+             "hint": "see the countdown 5 to 1 example.",
+             "placeholder": "Example format: range(1, 6)"},
+        ],
+    },
+]
+
+TOTAL_LESSONS = len(LESSONS)
+TOTAL_QUIZ_POINTS = sum(len(lesson["quiz"]) for lesson in LESSONS)
+
+
+# =====================================================================
+#  ACHIEVEMENTS
+#  One badge per passed lesson (the original reward) plus milestones.
+# =====================================================================
+
+LESSON_BADGES = [(f"lesson-{i}", lesson["title"], f"Perfect score on Lesson {i + 1}", str(i + 1))
+                 for i, lesson in enumerate(LESSONS)]
+MILESTONES = [
+    ("first_steps", "First Steps", "Opened your first lesson", "▶"),
+    ("first_quiz", "Quiz Taker", "Submitted your first quiz", "?"),
+    ("rank_coder", "Coder", "Passed 4 lessons and reached the Coder rank", "◆"),
+    ("rank_master", "Python Master", "Passed all 7 lessons: the highest rank", "★"),
+    ("certificate_unlocked", "Certified", "Unlocked the certificate of completion", "✓"),
+    ("certificate_sent", "Delivered", "Emailed the certificate PDF", "✉"),
+]
+ACHIEVEMENTS = LESSON_BADGES + MILESTONES
+ACHIEVEMENT_INFO = {code: (title, desc, icon) for code, title, desc, icon in ACHIEVEMENTS}
+RANKS = [("Newbie", 0), ("Coder", 4), ("Python Master", 7)]
+
+
+# =====================================================================
+#  ACCOUNT SECURITY AND VALIDATION
+# =====================================================================
+
+PBKDF2_ITERATIONS = 310_000
+USERNAME_RE = re.compile(r"[A-Za-z0-9_.]{3,20}")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_DUMMY_HASH = []
+
+
+class ValidationError(ValueError):
+    """A user-facing input problem (shown in the form, never a crash)."""
+
+
+class DatabaseError(Exception):
+    """The progress database could not be read or written."""
+
+
+def hash_password(password, salt=None, iterations=PBKDF2_ITERATIONS):
+    """Salted PBKDF2-SHA256. Only this hash is stored, never the password itself."""
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password, stored):
+    try:
+        algorithm, iterations, salt_hex, digest_hex = stored.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                     bytes.fromhex(salt_hex), int(iterations))
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _dummy_verify(password):
+    """Spend the same time on unknown usernames so logins don't reveal which accounts exist."""
+    if not _DUMMY_HASH:
+        _DUMMY_HASH.append(hash_password(secrets.token_hex(8)))
+    verify_password(password, _DUMMY_HASH[0])
+
+
+def clean_full_name(value):
+    value = " ".join(value.split())
+    if len(value) < 2:
+        raise ValidationError("Full name must have at least 2 characters.")
+    if len(value) > 60:
+        raise ValidationError("Full name can be at most 60 characters.")
+    return value
+
+
+def clean_username(value):
+    value = value.strip().lstrip("@")
+    if not USERNAME_RE.fullmatch(value):
+        raise ValidationError("Username must be 3-20 characters using letters, numbers, _ or . only.")
+    return value
+
+
+def clean_email(value):
+    value = value.strip()
+    if len(value) > 254 or not EMAIL_RE.fullmatch(value):
+        raise ValidationError("Please enter a valid email address, like you@gmail.com.")
+    return value
+
+
+def clean_bio(value):
+    value = value.strip()
+    if len(value) > 160:
+        raise ValidationError(f"Bio can be at most 160 characters (it has {len(value)}).")
+    return value
+
+
+def check_password_strength(password):
+    if len(password) < 8:
+        raise ValidationError("Password must be at least 8 characters.")
+    if len(password) > 128:
+        raise ValidationError("Password can be at most 128 characters.")
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        raise ValidationError("Password must contain at least one letter and one number.")
+
+
+def now_iso():
+    return datetime.datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+
+def format_date(value, with_time=False):
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "—"
+    return moment.strftime("%b %d, %Y · %I:%M %p" if with_time else "%B %d, %Y")
+
+
+def initials(name):
+    letters = "".join(word[0] for word in name.split()[:2] if word)
+    return letters.upper() or "?"
+
+
+def shorten(text, limit):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+# =====================================================================
+#  PROFILE PICTURES (Pillow)
+# =====================================================================
+
+AVATAR_SIZE = 512
+AVATAR_TYPES = (".png", ".jpg", ".jpeg")
+AVATAR_MAX_BYTES = 10 * 1024 * 1024
+
+
+def load_avatar_source(path):
+    """Open a user-chosen PNG/JPG/JPEG and return a square RGBA image ready to preview and save."""
+    if not PIL_OK:
+        raise ValidationError("Profile pictures need Pillow. Run:  pip install pillow")
+    path = Path(path)
+    if path.suffix.lower() not in AVATAR_TYPES:
+        raise ValidationError("Please choose a PNG, JPG or JPEG image.")
+    try:
+        if path.stat().st_size > AVATAR_MAX_BYTES:
+            raise ValidationError("That image is larger than 10 MB. Please choose a smaller one.")
+        with Image.open(path) as source:
+            if source.format not in ("PNG", "JPEG"):
+                raise ValidationError("That file is not a real PNG or JPEG image.")
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+    except ValidationError:
+        raise
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ValidationError(f"Could not open that image ({exc}).") from exc
+    return ImageOps.fit(image, (AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
+
+
+def circle_image(source, size, scale=3):
+    """Crop an image into a smooth circle (drawn larger, then scaled down for anti-aliasing)."""
+    big = size * scale
+    image = ImageOps.fit(source.convert("RGBA"), (big, big), Image.LANCZOS)
+    mask = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, big - 1, big - 1), fill=255)
+    result = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    result.paste(image, (0, 0), mask)
+    return result
+
+
+# =====================================================================
+#  DATABASE (SQLite)
+#  Every table is keyed by user_id and every query filters by it, so one
+#  account can never read or overwrite another account's data.
+# =====================================================================
+
+SCHEMA_VERSION = 1
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    username       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    email          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash  TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    last_login     TEXT
+);
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    full_name   TEXT NOT NULL,
+    bio         TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS profile_pictures (
+    user_id        INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    file_path      TEXT NOT NULL,
+    original_name  TEXT,
+    uploaded_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lesson_progress (
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    lesson_index     INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'not_started'
+                     CHECK (status IN ('not_started', 'in_progress', 'completed')),
+    best_score       INTEGER NOT NULL DEFAULT 0,
+    total_questions  INTEGER NOT NULL DEFAULT 0,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    first_opened_at  TEXT,
+    last_opened_at   TEXT,
+    completed_at     TEXT,
+    PRIMARY KEY (user_id, lesson_index)
+);
+CREATE TABLE IF NOT EXISTS quiz_results (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    lesson_index  INTEGER NOT NULL,
+    score         INTEGER NOT NULL,
+    total         INTEGER NOT NULL,
+    passed        INTEGER NOT NULL,
+    taken_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quiz_results_user ON quiz_results(user_id, taken_at);
+CREATE TABLE IF NOT EXISTS achievements (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code       TEXT NOT NULL,
+    earned_at  TEXT NOT NULL,
+    PRIMARY KEY (user_id, code)
+);
+CREATE TABLE IF NOT EXISTS user_state (
+    user_id                  INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    current_lesson           INTEGER,
+    rank                     TEXT NOT NULL DEFAULT 'Newbie',
+    certificate_eligible     INTEGER NOT NULL DEFAULT 0,
+    certificate_unlocked_at  TEXT,
+    cert_sent                INTEGER NOT NULL DEFAULT 0,
+    cert_sent_at             TEXT,
+    pdf_saved                INTEGER NOT NULL DEFAULT 0
+);
+"""
+STATE_COLUMNS = {"current_lesson", "rank", "certificate_eligible", "certificate_unlocked_at",
+                 "cert_sent", "cert_sent_at", "pdf_saved"}
+
+
+def _db_guard(method):
+    """Turn low-level sqlite3 errors into a friendly DatabaseError."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except sqlite3.Error as exc:
+            raise DatabaseError(str(exc)) from exc
+    return wrapper
+
+
+class Database:
+
+    def __init__(self, path=DB_FILE):
+        self.path = Path(path)
+        self.root = self.path.parent
+        self.avatar_dir = self.root / "avatars"
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.avatar_dir.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(str(self.path), timeout=10)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.executescript(SCHEMA)
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.conn.commit()
+        except (sqlite3.Error, OSError) as exc:
+            raise DatabaseError(f"Could not open the database at {self.path} ({exc})") from exc
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+
+    # ---------------- accounts ----------------
+
+    @_db_guard
+    def username_taken(self, username, exclude_id=None):
+        row = self.conn.execute("SELECT 1 FROM users WHERE username = ? AND id != ?",
+                                (username, exclude_id or -1)).fetchone()
+        return row is not None
+
+    @_db_guard
+    def email_taken(self, email, exclude_id=None):
+        row = self.conn.execute("SELECT 1 FROM users WHERE email = ? AND id != ?",
+                                (email, exclude_id or -1)).fetchone()
+        return row is not None
+
+    @_db_guard
+    def create_user(self, full_name, username, email, password):
+        if self.username_taken(username):
+            raise ValidationError("That username is already taken. Please choose another.")
+        if self.email_taken(email):
+            raise ValidationError("An account with that email already exists. Try signing in.")
+        stamp = now_iso()
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    "INSERT INTO users (username, email, password_hash, created_at, last_login) "
+                    "VALUES (?, ?, ?, ?, ?)", (username, email, hash_password(password), stamp, stamp))
+                user_id = cursor.lastrowid
+                self.conn.execute("INSERT INTO profiles (user_id, full_name, bio, updated_at) "
+                                  "VALUES (?, ?, '', ?)", (user_id, full_name, stamp))
+                self.conn.execute("INSERT INTO user_state (user_id) VALUES (?)", (user_id,))
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("That username or email is already registered.") from exc
+        return user_id
+
+    @_db_guard
+    def authenticate(self, login, password):
+        """Return the user id for a username-or-email + password, or None."""
+        row = self.conn.execute("SELECT id, password_hash FROM users WHERE username = ? OR email = ?",
+                                (login, login)).fetchone()
+        if row is None:
+            _dummy_verify(password)
+            return None
+        if not verify_password(password, row["password_hash"]):
+            return None
+        with self.conn:
+            self.conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (now_iso(), row["id"]))
+        return row["id"]
+
+    @_db_guard
+    def get_account(self, user_id):
+        row = self.conn.execute(
+            "SELECT u.id, u.username, u.email, u.created_at, u.last_login, p.full_name, p.bio, "
+            "pp.file_path AS avatar_file FROM users u JOIN profiles p ON p.user_id = u.id "
+            "LEFT JOIN profile_pictures pp ON pp.user_id = u.id WHERE u.id = ?", (user_id,)).fetchone()
+        if row is None:
+            return None
+        account = dict(row)
+        avatar_file = account.pop("avatar_file")
+        avatar = self.root / avatar_file if avatar_file else None
+        account["avatar_path"] = str(avatar) if avatar and avatar.is_file() else None
+        return account
+
+    @_db_guard
+    def update_profile(self, user_id, full_name, username, email, bio):
+        if self.username_taken(username, exclude_id=user_id):
+            raise ValidationError("That username is already taken. Please choose another.")
+        if self.email_taken(email, exclude_id=user_id):
+            raise ValidationError("Another account already uses that email address.")
+        try:
+            with self.conn:
+                self.conn.execute("UPDATE users SET username = ?, email = ? WHERE id = ?",
+                                  (username, email, user_id))
+                self.conn.execute("UPDATE profiles SET full_name = ?, bio = ?, updated_at = ? "
+                                  "WHERE user_id = ?", (full_name, bio, now_iso(), user_id))
+        except sqlite3.IntegrityError as exc:
+            raise ValidationError("That username or email is already registered.") from exc
+
+    @_db_guard
+    def change_password(self, user_id, current, new):
+        row = self.conn.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None or not verify_password(current, row["password_hash"]):
+            return False
+        with self.conn:
+            self.conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                              (hash_password(new), user_id))
+        return True
+
+    @_db_guard
+    def delete_user(self, user_id, password):
+        """Delete the account and ALL of its data (cascades) after re-checking the password."""
+        row = self.conn.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None or not verify_password(password, row["password_hash"]):
+            return False
+        with self.conn:
+            self.conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        shutil.rmtree(self.avatar_dir / f"user_{int(user_id)}", ignore_errors=True)
+        return True
+
+    # ---------------- profile pictures ----------------
+
+    def _remove_avatar_file(self, relative):
+        if not relative:
+            return
+        target = (self.root / relative).resolve()
+        if self.avatar_dir.resolve() in target.parents:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+    @_db_guard
+    def set_avatar(self, user_id, image, original_name=None):
+        """Save a processed PIL image as the user's picture and record its path."""
+        folder = self.avatar_dir / f"user_{int(user_id)}"
+        filename = f"avatar_{datetime.datetime.now():%Y%m%d%H%M%S}_{secrets.token_hex(3)}.png"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            image.save(folder / filename, "PNG", optimize=True)
+        except OSError as exc:
+            raise DatabaseError(f"Could not save the picture file ({exc})") from exc
+        relative = f"avatars/user_{int(user_id)}/{filename}"
+        old = self.conn.execute("SELECT file_path FROM profile_pictures WHERE user_id = ?",
+                                (user_id,)).fetchone()
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO profile_pictures (user_id, file_path, original_name, uploaded_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET file_path = excluded.file_path, "
+                    "original_name = excluded.original_name, uploaded_at = excluded.uploaded_at",
+                    (user_id, relative, original_name, now_iso()))
+        except sqlite3.Error:
+            self._remove_avatar_file(relative)
+            raise
+        if old:
+            self._remove_avatar_file(old["file_path"])
+        return str(self.root / relative)
+
+    @_db_guard
+    def remove_avatar(self, user_id):
+        old = self.conn.execute("SELECT file_path FROM profile_pictures WHERE user_id = ?",
+                                (user_id,)).fetchone()
+        with self.conn:
+            self.conn.execute("DELETE FROM profile_pictures WHERE user_id = ?", (user_id,))
+        if old:
+            self._remove_avatar_file(old["file_path"])
+
+    # ---------------- progress ----------------
+
+    @_db_guard
+    def load_progress(self, user_id):
+        rows = self.conn.execute("SELECT * FROM lesson_progress WHERE user_id = ?", (user_id,)).fetchall()
+        return {row["lesson_index"]: dict(row) for row in rows}
+
+    @_db_guard
+    def mark_lesson_opened(self, user_id, index):
+        stamp = now_iso()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO lesson_progress (user_id, lesson_index, status, first_opened_at, last_opened_at) "
+                "VALUES (?, ?, 'in_progress', ?, ?) ON CONFLICT(user_id, lesson_index) DO UPDATE SET "
+                "last_opened_at = excluded.last_opened_at, "
+                "first_opened_at = COALESCE(first_opened_at, excluded.first_opened_at), "
+                "status = CASE WHEN status = 'not_started' THEN 'in_progress' ELSE status END",
+                (user_id, index, stamp, stamp))
+            self.conn.execute("INSERT OR IGNORE INTO user_state (user_id) VALUES (?)", (user_id,))
+            self.conn.execute("UPDATE user_state SET current_lesson = ? WHERE user_id = ?", (index, user_id))
+
+    @_db_guard
+    def record_quiz(self, user_id, index, score, total):
+        passed = int(score == total)
+        stamp = now_iso()
+        with self.conn:
+            self.conn.execute("INSERT INTO quiz_results (user_id, lesson_index, score, total, passed, taken_at) "
+                              "VALUES (?, ?, ?, ?, ?, ?)", (user_id, index, score, total, passed, stamp))
+            self.conn.execute(
+                "INSERT INTO lesson_progress (user_id, lesson_index, status, best_score, total_questions, "
+                "attempts, first_opened_at, last_opened_at, completed_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(user_id, lesson_index) DO UPDATE SET "
+                "best_score = MAX(best_score, excluded.best_score), "
+                "total_questions = excluded.total_questions, attempts = attempts + 1, "
+                "last_opened_at = excluded.last_opened_at, "
+                "status = CASE WHEN status = 'completed' OR excluded.status = 'completed' "
+                "THEN 'completed' ELSE 'in_progress' END, "
+                "completed_at = COALESCE(completed_at, excluded.completed_at)",
+                (user_id, index, "completed" if passed else "in_progress", score, total,
+                 stamp, stamp, stamp if passed else None))
+
+    @_db_guard
+    def recent_quiz_results(self, user_id, limit=8):
+        rows = self.conn.execute("SELECT * FROM quiz_results WHERE user_id = ? ORDER BY taken_at DESC, id DESC "
+                                 "LIMIT ?", (user_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    @_db_guard
+    def quiz_summary(self, user_id):
+        row = self.conn.execute("SELECT COUNT(*) AS attempts, COALESCE(SUM(passed), 0) AS passed "
+                                "FROM quiz_results WHERE user_id = ?", (user_id,)).fetchone()
+        return dict(row)
+
+    @_db_guard
+    def grant_achievement(self, user_id, code):
+        """Return True only the first time the achievement is earned."""
+        with self.conn:
+            cursor = self.conn.execute("INSERT OR IGNORE INTO achievements (user_id, code, earned_at) "
+                                       "VALUES (?, ?, ?)", (user_id, code, now_iso()))
+        return cursor.rowcount == 1
+
+    @_db_guard
+    def achievements(self, user_id):
+        rows = self.conn.execute("SELECT code, earned_at FROM achievements WHERE user_id = ?",
+                                 (user_id,)).fetchall()
+        return {row["code"]: row["earned_at"] for row in rows}
+
+    @_db_guard
+    def get_state(self, user_id):
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO user_state (user_id) VALUES (?)", (user_id,))
+        return dict(self.conn.execute("SELECT * FROM user_state WHERE user_id = ?", (user_id,)).fetchone())
+
+    @_db_guard
+    def update_state(self, user_id, **fields):
+        fields = {key: value for key, value in fields.items() if key in STATE_COLUMNS}
+        if not fields:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO user_state (user_id) VALUES (?)", (user_id,))
+            self.conn.execute(f"UPDATE user_state SET {assignments} WHERE user_id = ?",
+                              (*fields.values(), user_id))
+
+
+# =====================================================================
+#  STATE
+# =====================================================================
+
+class QuestState:
+    def __init__(self):
+        self.player = ""
+        self.email = ""
+        self.cert_sent = False
+        self.pdf_generated = False
+        self.pdf_saved = False
+        self.last_error = None
+        self.passed_lessons = set()
+        # Account data (filled from the database when a user signs in)
+        self.user_id = None
+        self.username = ""
+        self.bio = ""
+        self.avatar_path = None
+        self.created_at = None
+        self.last_login = None
+        self.lesson_status = {}          # lesson index -> "in_progress" / "completed"
+        self.progress_rows = {}          # lesson index -> saved row (scores, attempts, dates)
+        self.current_lesson = None
+        self.certificate_unlocked_at = None
+        self.achievements = {}           # code -> earned_at
+
+    def load_account(self, db, user_id):
+        """Restore everything saved for this one account."""
+        account = db.get_account(user_id)
+        if account is None:
+            raise DatabaseError("That account no longer exists.")
+        state = db.get_state(user_id)
+        self.user_id = user_id
+        self.apply_account(account)
+        self.reload_progress(db)
+        current = state["current_lesson"]
+        self.current_lesson = current if current is not None and 0 <= current < TOTAL_LESSONS else None
+        self.cert_sent = bool(state["cert_sent"])
+        self.pdf_saved = bool(state["pdf_saved"])
+        self.certificate_unlocked_at = state["certificate_unlocked_at"]
+        self.achievements = db.achievements(user_id)
+
+    def apply_account(self, account):
+        self.player = account["full_name"]
+        self.username = account["username"]
+        self.email = account["email"]
+        self.bio = account["bio"] or ""
+        self.avatar_path = account["avatar_path"]
+        self.created_at = account["created_at"]
+        self.last_login = account["last_login"]
+
+    def reload_progress(self, db):
+        self.progress_rows = {i: row for i, row in db.load_progress(self.user_id).items()
+                              if 0 <= i < TOTAL_LESSONS}
+        self.lesson_status = {i: row["status"] for i, row in self.progress_rows.items()
+                              if row["status"] != "not_started"}
+        self.passed_lessons = {i for i, status in self.lesson_status.items() if status == "completed"}
+
+    def status(self, index):
+        if index in self.passed_lessons:
+            return "completed"
+        return self.lesson_status.get(index, "not_started")
+
+    def counts(self):
+        in_progress = sum(1 for i in range(TOTAL_LESSONS) if self.status(i) == "in_progress")
+        return self.passed, in_progress, TOTAL_LESSONS - self.passed - in_progress
+
+    def best_points(self):
+        return sum(row["best_score"] for row in self.progress_rows.values())
+
+    @property
+    def passed(self):
+        return len(self.passed_lessons)
+
+    @property
+    def rank(self):
+        if self.passed == 7:
+            return "Python Master"
+        elif self.passed >= 4:
+            return "Coder"
+        return "Newbie"
+
+    def is_passed(self, index):
+        return index in self.passed_lessons
+
+    def mark_passed(self, index):
+        newly_passed = index not in self.passed_lessons
+        self.passed_lessons.add(index)
+        self.lesson_status[index] = "completed"
+        return newly_passed
+
+    def next_unpassed(self, start=0):
+        for offset in range(TOTAL_LESSONS):
+            index = (start + offset) % TOTAL_LESSONS
+            if index not in self.passed_lessons:
+                return index
+        return None
+
+
+# =====================================================================
+#  APPLICATION
+# =====================================================================
+
+class PythonJourneyApp(ctk.CTk):
+
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+
+        self.quest = QuestState()
+        self.sending = False
+        self.current_key = None
+        self.root_frame = None
+        self.scroll = None
+        self.nav_buttons = {}
+        self.quiz_items = []
+        self.quiz_done = False
+        self.cert_actions = None
+        self._pdf_cache = None      # ((player, rank, passed, date), bytes)
+        self._temp_preview = None
+        self._fonts = {}
+        self._toasts = []
+        self._wrap_targets = []
+        self._wrap_job = None
+        self._avatar_cache = {}
+        self.auth_mode = "register"
+
+        try:
+            self.db = Database()
+        except DatabaseError as exc:
+            self.withdraw()
+            messagebox.showerror("Python Journey", f"Your saved progress could not be opened.\n\n{exc}")
+            self.destroy()
+            sys.exit(1)
+
+        self.title("Python Journey — Learn Python. Pass quizzes. Win badges.")
+        self.configure(fg_color=C["bg"])
+        self.minsize(1000, 660)
+        self._center_window(1220, 790)
+        self.protocol("WM_DELETE_WINDOW", self.on_exit)
+
+        self.show_welcome()
+        self._fade_in()
+
+    # ---------------------------------------------------------------
+    #  Generic helpers
+    # ---------------------------------------------------------------
+
+    def font(self, size, weight="normal", kind="ui", slant="roman"):
+        key = (size, weight, kind, slant)
+        if key not in self._fonts:
+            self._fonts[key] = ctk.CTkFont(family=FONT_FAMILIES[kind], size=size,
+                                           weight=weight, slant=slant)
+        return self._fonts[key]
+
+    def _scaling(self):
+        try:
+            return ctk.ScalingTracker.get_widget_scaling(self)
+        except Exception:
+            return 1.0
+
+    def _center_window(self, width, height):
+        self.update_idletasks()
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _fade_in(self, alpha=0.0):
+        try:
+            alpha = min(1.0, alpha + 0.08)
+            self.attributes("-alpha", alpha)
+            if alpha < 1.0:
+                self.after(15, lambda: self._fade_in(alpha))
+        except tk.TclError:
+            pass
+
+    def run_in_background(self, work, on_done):
+        """Run slow network work off the UI thread, then call on_done(value, error) on the UI thread."""
+        result = {}
+
+        def target():
+            try:
+                result["value"] = work()
+            except Exception as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+
+        def poll():
+            if worker.is_alive():
+                self.after(120, poll)
+            else:
+                on_done(result.get("value"), result.get("error"))
+
+        self.after(120, poll)
+
+    def _reset_root(self):
+        if self.root_frame is not None:
+            self.root_frame.destroy()
+        self.root_frame = ctk.CTkFrame(self, fg_color=C["bg"], corner_radius=0)
+        self.root_frame.pack(fill="both", expand=True)
+        self.scroll = None
+        self.nav_buttons = {}
+        for toast in self._toasts:
+            toast.lift()
+
+    def _card(self, parent, fg=None, border=None, radius=18):
+        return ctk.CTkFrame(parent, fg_color=fg or C["card"], corner_radius=radius,
+                            border_width=1, border_color=border or C["border"])
+
+    def _text(self, parent, text, size=14, weight="normal", color=None, kind="ui",
+              wrap=True, inset=150, columns=1, justify="left", anchor="w", **kwargs):
+        label = ctk.CTkLabel(parent, text=text, font=self.font(size, weight, kind),
+                             text_color=color or C["text"], justify=justify, anchor=anchor, **kwargs)
+        if wrap:
+            self._wrap_targets.append((label, inset, columns))
+        return label
+
+    def _button(self, parent, text, command, variant="primary", width=None, height=40):
+        styles = {
+            "primary": dict(fg_color=C["primary"], hover_color=C["primary_hover"],
+                            text_color="#FFFFFF", border_width=0),
+            "accent": dict(fg_color=C["accent"], hover_color=C["accent_hover"],
+                           text_color="#111827", border_width=0),
+            "ghost": dict(fg_color="transparent", hover_color=C["card_hover"],
+                          text_color=C["text"], border_width=1, border_color=C["border"]),
+            "danger": dict(fg_color="transparent", hover_color=C["error_soft"],
+                           text_color=C["error"], border_width=1, border_color="#5B2328"),
+        }
+        options = dict(text=text, command=command, height=height, corner_radius=10,
+                       font=self.font(14, "bold"), text_color_disabled=C["muted"], **styles[variant])
+        if width:
+            options["width"] = width
+        return ctk.CTkButton(parent, **options)
+
+    def _entry(self, parent, placeholder, show=None, width=380):
+        options = dict(placeholder_text=placeholder, width=width, height=44, corner_radius=10,
+                       fg_color=C["surface"], border_color=C["border"], border_width=1,
+                       text_color=C["text"], placeholder_text_color=C["muted"], font=self.font(14))
+        if show:
+            options["show"] = show
+        return ctk.CTkEntry(parent, **options)
+
+    def _pill(self, parent, text, fg, color):
+        return ctk.CTkLabel(parent, text=f"  {text}  ", fg_color=fg, text_color=color,
+                            corner_radius=10, height=24, font=self.font(11, "bold"))
+
+    def _status_pill(self, parent, index):
+        status = self.quest.status(index)
+        if status == "completed":
+            return self._pill(parent, "✓ COMPLETED", C["success_soft"], C["success"])
+        if status == "in_progress":
+            return self._pill(parent, "● IN PROGRESS", C["primary_soft"], C["primary_text"])
+        return self._pill(parent, "NOT STARTED", C["border"], C["muted"])
+
+    # ---------------------------------------------------------------
+    #  Avatars (circular profile pictures)
+    # ---------------------------------------------------------------
+
+    def _ctk_circle(self, pil_image, size):
+        return ctk.CTkImage(light_image=circle_image(pil_image, size), dark_image=circle_image(pil_image, size),
+                            size=(size, size))
+
+    def _avatar_image(self, path, size):
+        if not PIL_OK or not path or not os.path.isfile(path):
+            return None
+        try:
+            key = (path, size, os.path.getmtime(path))
+            if key not in self._avatar_cache:
+                with Image.open(path) as source:
+                    source.load()
+                    self._avatar_cache[key] = self._ctk_circle(source, size)
+            return self._avatar_cache[key]
+        except (OSError, ValueError):
+            return None
+
+    def _avatar(self, parent, size, ring=False, path="current", image=None, name=None):
+        """Circular avatar: the user's picture, or their initials when no picture is set."""
+        if path == "current":
+            path = self.quest.avatar_path
+        name = self.quest.player if name is None else name
+        pad = 4 if ring else 0
+        outer = size + pad * 2
+        holder = ctk.CTkFrame(parent, width=outer, height=outer, corner_radius=outer // 2,
+                              fg_color="transparent", border_width=2 if ring else 0,
+                              border_color=C["accent"])
+        holder.pack_propagate(False)
+        holder.grid_propagate(False)
+        picture = self._ctk_circle(image, size) if image is not None else self._avatar_image(path, size)
+        if picture is not None:
+            label = ctk.CTkLabel(holder, text="", image=picture, width=size, height=size)
+            label._keep_image = picture
+        else:
+            label = ctk.CTkLabel(holder, text=initials(name or "?"), width=size, height=size,
+                                 corner_radius=size // 2, fg_color=C["primary"], text_color="#FFFFFF",
+                                 font=self.font(max(12, int(size * 0.36)), "bold"))
+        label.place(relx=0.5, rely=0.5, anchor="center")
+        return holder
+
+    def _bind_click(self, widget, command):
+        widget.bind("<Button-1>", lambda _e: command())
+        try:
+            widget.configure(cursor="hand2")
+        except (tk.TclError, ValueError):
+            pass
+        for child in widget.winfo_children():
+            self._bind_click(child, command)
+
+    def _logo(self, parent, size=44):
+        return ctk.CTkLabel(parent, text="Py", width=size, height=size, corner_radius=size // 4,
+                            fg_color=C["accent"], text_color="#0B1220",
+                            font=self.font(int(size * 0.4), "bold"))
+
+    def _on_body_resize(self, event):
+        if self._wrap_job is not None:
+            self.after_cancel(self._wrap_job)
+        self._wrap_job = self.after(60, lambda: self._update_wrap(event.width))
+
+    def _update_wrap(self, width):
+        self._wrap_job = None
+        if width <= 1:
+            return
+        logical_width = width / self._scaling()
+        alive = []
+        for label, inset, columns in self._wrap_targets:
+            try:
+                label.configure(wraplength=max(240, (logical_width - inset) / columns))
+                alive.append((label, inset, columns))
+            except tk.TclError:
+                continue
+        self._wrap_targets = alive
+
+    def _scroll_to_bottom(self):
+        try:
+            self.scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------
+    #  Toast notifications
+    # ---------------------------------------------------------------
+
+    def toast(self, message, kind="info", duration=4200):
+        palette = {
+            "info": (C["primary_soft"], C["primary"], C["primary_text"]),
+            "success": (C["success_soft"], C["success"], C["output"]),
+            "error": (C["error_soft"], C["error"], C["error"]),
+        }
+        bg, border, color = palette[kind]
+        frame = ctk.CTkFrame(self, fg_color=bg, corner_radius=12, border_width=1, border_color=border)
+        ctk.CTkLabel(frame, text=message, wraplength=340, justify="left", anchor="w",
+                     font=self.font(13, "bold"), text_color=color).pack(padx=16, pady=12)
+        self._toasts.append(frame)
+        while len(self._toasts) > 3:
+            oldest = self._toasts.pop(0)
+            oldest.destroy()
+        self._layout_toasts()
+        frame.lift()
+        self.after(duration, lambda: self._dismiss_toast(frame))
+
+    def _layout_toasts(self):
+        y = 22
+        scale = self._scaling()
+        for frame in self._toasts:
+            frame.place(relx=1.0, x=-22, y=y, anchor="ne")
+            frame.update_idletasks()
+            y += frame.winfo_reqheight() / scale + 10
+
+    def _dismiss_toast(self, frame):
+        if frame in self._toasts:
+            self._toasts.remove(frame)
+            frame.destroy()
+            self._layout_toasts()
+
+    # ---------------------------------------------------------------
+    #  Welcome / login screen
+    # ---------------------------------------------------------------
+
+    def show_welcome(self, mode="register"):
+        self._reset_root()
+        frame = self.root_frame
+        frame.grid_columnconfigure(0, weight=5, uniform="welcome")
+        frame.grid_columnconfigure(1, weight=6, uniform="welcome")
+        frame.grid_rowconfigure(0, weight=1)
+
+        hero = ctk.CTkFrame(frame, fg_color=C["sidebar"], corner_radius=0)
+        hero.grid(row=0, column=0, sticky="nsew")
+        inner = ctk.CTkFrame(hero, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._logo(inner, 60).pack(anchor="w")
+        ctk.CTkLabel(inner, text="PYTHON JOURNEY", font=self.font(13, "bold"),
+                     text_color=C["accent"]).pack(anchor="w", pady=(22, 2))
+        ctk.CTkLabel(inner, text="Learn Python.\nPass quizzes.\nWin badges.", justify="left",
+                     font=self.font(34, "bold"), text_color=C["text"]).pack(anchor="w")
+        ctk.CTkLabel(inner, text="Seven bite-sized lessons take you from your first print() "
+                                 "to loops. Ace every quiz to become a Python Master.",
+                     wraplength=380, justify="left", font=self.font(14),
+                     text_color=C["muted"]).pack(anchor="w", pady=(14, 22))
+
+        features = [
+            ("7 hands-on lessons", "Real code examples with their actual output"),
+            ("Instant quiz feedback", "See what you got right, with hints for the rest"),
+            ("Ranks to earn", "Newbie  →  Coder  →  Python Master"),
+            ("Progress saved automatically", "Sign in any time and continue where you left off"),
+            ("Your own certificate", "A real PDF: saved, copied, or emailed to your Gmail"),
+        ]
+        for title, desc in features:
+            row = ctk.CTkFrame(inner, fg_color="transparent")
+            row.pack(anchor="w", pady=6, fill="x")
+            ctk.CTkLabel(row, text="✓", width=30, height=30, corner_radius=8, fg_color=C["card"],
+                         text_color=C["accent"], font=self.font(13, "bold")).pack(side="left", anchor="n")
+            column = ctk.CTkFrame(row, fg_color="transparent")
+            column.pack(side="left", padx=12)
+            ctk.CTkLabel(column, text=title, font=self.font(14, "bold"), text_color=C["text"],
+                         height=20, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(column, text=desc, font=self.font(12), text_color=C["muted"],
+                         height=18, anchor="w").pack(anchor="w")
+
+        side = ctk.CTkFrame(frame, fg_color=C["bg"], corner_radius=0)
+        side.grid(row=0, column=1, sticky="nsew")
+        card = self._card(side, radius=20)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(padx=38, pady=32)
+
+        self.auth_title = ctk.CTkLabel(body, text="", font=self.font(24, "bold"), text_color=C["text"])
+        self.auth_title.pack(anchor="w")
+        self.auth_subtitle = ctk.CTkLabel(body, text="", font=self.font(13), text_color=C["muted"])
+        self.auth_subtitle.pack(anchor="w", pady=(2, 16))
+
+        self.auth_form = ctk.CTkFrame(body, fg_color="transparent")
+        self.auth_form.pack(anchor="w", fill="x")
+
+        self.form_status = ctk.CTkLabel(body, text="", font=self.font(13, "bold"), wraplength=380,
+                                        justify="left", anchor="w", height=22)
+        self.form_status.pack(anchor="w", fill="x", pady=(10, 4))
+
+        self.start_button = self._button(body, "Sign In", self._on_auth_submit, width=380, height=46)
+        self.start_button.pack(anchor="w", pady=(4, 10))
+
+        self.auth_switch = ctk.CTkLabel(body, text="", font=self.font(12, "bold"),
+                                        text_color=C["primary_text"], cursor="hand2", height=18)
+        self.auth_switch.pack(anchor="w")
+        self.auth_switch.bind("<Button-1>", lambda _e: self._switch_auth_mode(
+            "Sign In" if self.auth_mode == "register" else "Create Account"))
+
+        self._switch_auth_mode("Create Account" if mode == "register" else "Sign In")
+
+    def _switch_auth_mode(self, value):
+        self.auth_mode = "register" if value == "Create Account" else "signin"
+        for child in self.auth_form.winfo_children():
+            child.destroy()
+        self._set_form_status("", "info")
+        form = self.auth_form
+        if self.auth_mode == "signin":
+            self.auth_title.configure(text="Welcome back")
+            self.auth_subtitle.configure(text="Sign in to continue your quest. Your progress is saved.")
+            self._field_label(form, "Username or email")
+            self.login_entry = self._entry(form, "e.g. maria_s or maria@gmail.com")
+            self.login_entry.pack(anchor="w", pady=(0, 14))
+            self._field_label(form, "Password")
+            self.password_entry = self._entry(form, "Your password", show="•")
+            self.password_entry.pack(anchor="w")
+            entries = [self.login_entry, self.password_entry]
+            self.start_button.configure(text="Sign In")
+            self.auth_switch.configure(text="New here? Create an account  →")
+        else:
+            self.auth_title.configure(text="Begin your quest")
+            self.auth_subtitle.configure(text="Create an account so every lesson you pass is saved.")
+            self._field_label(form, "What is your name, traveler?")
+            self.fullname_entry = self._entry(form, "Full name, e.g. Maria Santos")
+            self.fullname_entry.pack(anchor="w", pady=(0, 12))
+            self._field_label(form, "Username")
+            self.username_entry = self._entry(form, "3-20 letters, numbers, _ or .")
+            self.username_entry.pack(anchor="w", pady=(0, 12))
+            self._field_label(form, "Email address (used for your certificate)")
+            self.email_entry = self._entry(form, "you@gmail.com")
+            self.email_entry.pack(anchor="w", pady=(0, 12))
+            passwords = ctk.CTkFrame(form, fg_color="transparent")
+            passwords.pack(anchor="w")
+            left = ctk.CTkFrame(passwords, fg_color="transparent")
+            left.pack(side="left", padx=(0, 10))
+            right = ctk.CTkFrame(passwords, fg_color="transparent")
+            right.pack(side="left")
+            self._field_label(left, "Password")
+            self.password_entry = self._entry(left, "Min. 8, letters + numbers", show="•", width=185)
+            self.password_entry.pack(anchor="w")
+            self._field_label(right, "Confirm password")
+            self.confirm_entry = self._entry(right, "Type it again", show="•", width=185)
+            self.confirm_entry.pack(anchor="w")
+            entries = [self.fullname_entry, self.username_entry, self.email_entry,
+                       self.password_entry, self.confirm_entry]
+            self.start_button.configure(text="Create Account")
+            self.auth_switch.configure(text="Already have an account? Sign in  →")
+        for entry in entries:
+            entry.bind("<Return>", lambda _e: self._on_auth_submit())
+        self.after(150, lambda: entries[0].winfo_exists() and entries[0].focus_set())
+
+    def _field_label(self, parent, text):
+        ctk.CTkLabel(parent, text=text, font=self.font(13, "bold"), text_color=C["text_soft"],
+                     height=20).pack(anchor="w", pady=(0, 6))
+
+    def _set_form_status(self, message, kind="error"):
+        color = {"error": C["error"], "info": C["primary_text"], "success": C["success"]}[kind]
+        self.form_status.configure(text=message, text_color=color)
+
+    def _set_form_busy(self, busy, text=None):
+        self.start_button.configure(state="disabled" if busy else "normal",
+                                    text=text or ("Sign In" if self.auth_mode == "signin" else "Create Account"))
+
+    def _on_auth_submit(self):
+        if str(self.start_button.cget("state")) == "disabled":
+            return
+        if self.auth_mode == "signin":
+            self._on_sign_in()
+        else:
+            self._on_register()
+
+    def _on_sign_in(self):
+        login = self.login_entry.get().strip().lstrip("@")
+        password = self.password_entry.get()
+        if not login or not password:
+            self._set_form_status("Enter your username (or email) and your password.")
+            return
+        self._set_form_busy(True, "Signing in...")
+        self.update_idletasks()
+        try:
+            user_id = self.db.authenticate(login, password)
+        except DatabaseError as exc:
+            self._set_form_busy(False)
+            self._set_form_status(f"Could not read your account: {exc}")
+            return
+        self._set_form_busy(False)
+        if user_id is None:
+            self._set_form_status("Incorrect username/email or password. Try again.")
+            self.password_entry.delete(0, "end")
+            self.password_entry.focus_set()
+            return
+        self._begin(user_id)
+
+    def _on_register(self):
+        try:
+            full_name = clean_full_name(self.fullname_entry.get())
+            username = clean_username(self.username_entry.get())
+            email = clean_email(self.email_entry.get())
+            password = self.password_entry.get()
+            check_password_strength(password)
+            if password != self.confirm_entry.get():
+                raise ValidationError("The two passwords do not match.")
+        except ValidationError as exc:
+            self._set_form_status(str(exc))
+            return
+        self._set_form_busy(True, "Creating your account...")
+        self.update_idletasks()
+        try:
+            user_id = self.db.create_user(full_name, username, email, password)
+        except ValidationError as exc:
+            self._set_form_busy(False)
+            self._set_form_status(str(exc))
+            return
+        except DatabaseError as exc:
+            self._set_form_busy(False)
+            self._set_form_status(f"Could not create the account: {exc}")
+            return
+        self._set_form_busy(False)
+        self._begin(user_id, new_account=True)
+
+    def _begin(self, user_id, new_account=False):
+        quest = QuestState()
+        try:
+            quest.load_account(self.db, user_id)
+        except DatabaseError as exc:
+            self._set_form_status(f"Could not load your saved progress: {exc}")
+            return
+        self.quest = quest
+        self._pdf_cache = None
+        self.current_key = None
+        self._sync_state(silent=True)
+        self.build_shell()
+        self.show_dashboard()
+        if new_account:
+            self.toast(f"Welcome, {quest.player}! Your account is ready. Progress saves automatically.",
+                       "success")
+            self.toast("Choose any lesson you like.", "info")
+        else:
+            completed, in_progress, _ = quest.counts()
+            self.toast(f"Welcome back, {quest.player}! Progress restored: {completed}/{TOTAL_LESSONS} "
+                       f"completed, {in_progress} in progress.", "success")
+
+    # ---------------------------------------------------------------
+    #  Automatic saving (called from the lesson, quiz and certificate flows)
+    # ---------------------------------------------------------------
+
+    def _save(self, action, *args, silent=False, **kwargs):
+        """Run one database write for the signed-in user. On failure warn instead of crashing."""
+        if self.quest.user_id is None:
+            return False
+        try:
+            action(self.quest.user_id, *args, **kwargs)
+            return True
+        except DatabaseError as exc:
+            if not silent:
+                self.toast(f"Could not save your progress: {exc}", "error", 7000)
+            return False
+
+    def _award(self, code, silent=False):
+        if self.quest.user_id is None or code in self.quest.achievements:
+            return
+        try:
+            newly = self.db.grant_achievement(self.quest.user_id, code)
+        except DatabaseError as exc:
+            self.toast(f"Could not save the achievement: {exc}", "error", 6000)
+            return
+        self.quest.achievements[code] = now_iso()
+        if newly and not silent:
+            title, desc, _icon = ACHIEVEMENT_INFO[code]
+            self.toast(f"Achievement unlocked: {title}. {desc}.", "success")
+
+    def _autosave_lesson_opened(self, index):
+        quest = self.quest
+        if self._save(self.db.mark_lesson_opened, index):
+            if quest.status(index) == "not_started":
+                quest.lesson_status[index] = "in_progress"
+            quest.current_lesson = index
+            self._award("first_steps")
+
+    def _autosave_quiz(self, index, score, total):
+        quest = self.quest
+        if not self._save(self.db.record_quiz, index, score, total):
+            return
+        try:
+            quest.reload_progress(self.db)
+        except DatabaseError:
+            pass
+        self._award("first_quiz")
+        if score == total:
+            self._award(f"lesson-{index}", silent=True)
+        self._sync_state()
+
+    def _sync_state(self, silent=False):
+        """Save rank, certificate eligibility and delivery info, and grant earned milestones."""
+        quest = self.quest
+        if quest.user_id is None:
+            return
+        eligible = quest.passed == TOTAL_LESSONS
+        fields = dict(rank=quest.rank, certificate_eligible=int(eligible), cert_sent=int(quest.cert_sent),
+                      pdf_saved=int(quest.pdf_saved), current_lesson=quest.current_lesson)
+        if eligible and not quest.certificate_unlocked_at:
+            quest.certificate_unlocked_at = now_iso()
+            fields["certificate_unlocked_at"] = quest.certificate_unlocked_at
+        if quest.cert_sent and "certificate_sent" not in quest.achievements:
+            fields["cert_sent_at"] = now_iso()
+        self._save(self.db.update_state, silent=silent, **fields)
+        for index in sorted(quest.passed_lessons):
+            self._award(f"lesson-{index}", silent=True)
+        if quest.passed >= 4:
+            self._award("rank_coder", silent=True)
+        if eligible:
+            self._award("rank_master", silent=True)
+            self._award("certificate_unlocked", silent=silent)
+        if quest.cert_sent:
+            self._award("certificate_sent", silent=silent)
+
+    # ---------------------------------------------------------------
+    #  App shell: sidebar + header + scrollable body
+    # ---------------------------------------------------------------
+
+    def build_shell(self):
+        self._reset_root()
+        frame = self.root_frame
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        self._build_sidebar(frame)
+
+        main = ctk.CTkFrame(frame, fg_color=C["bg"], corner_radius=0)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=1)
+
+        self._build_header(main)
+
+        self.body = ctk.CTkFrame(main, fg_color=C["bg"], corner_radius=0)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        self.body.bind("<Configure>", self._on_body_resize)
+
+    def _build_sidebar(self, parent):
+        sidebar = ctk.CTkFrame(parent, fg_color=C["sidebar"], corner_radius=0, width=272)
+        sidebar.grid(row=0, column=0, sticky="nsw")
+        sidebar.pack_propagate(False)
+
+        brand = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand.pack(fill="x", padx=20, pady=(22, 14))
+        self._logo(brand, 40).pack(side="left")
+        names = ctk.CTkFrame(brand, fg_color="transparent")
+        names.pack(side="left", padx=12)
+        ctk.CTkLabel(names, text="Python Journey", font=self.font(15, "bold"),
+                     text_color=C["text"], height=20, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(names, text="Desktop Edition", font=self.font(11),
+                     text_color=C["muted"], height=16, anchor="w").pack(anchor="w")
+
+        bottom = ctk.CTkFrame(sidebar, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", padx=14, pady=16)
+        player = self._card(bottom, fg=C["surface"], radius=14)
+        player.pack(fill="x", pady=(0, 10))
+        player_row = ctk.CTkFrame(player, fg_color="transparent")
+        player_row.pack(fill="x", padx=12, pady=10)
+        self._avatar(player_row, 38).pack(side="left")
+        who = ctk.CTkFrame(player_row, fg_color="transparent")
+        who.pack(side="left", padx=10, fill="x", expand=True)
+        ctk.CTkLabel(who, text=shorten(self.quest.player, 22), font=self.font(13, "bold"),
+                     text_color=C["text"], height=18, anchor="w").pack(anchor="w", fill="x")
+        ctk.CTkLabel(who, text=f"@{shorten(self.quest.username, 22)}", font=self.font(11),
+                     text_color=C["muted"], height=16, anchor="w").pack(anchor="w", fill="x")
+        self._bind_click(player, self.show_profile)
+        actions = ctk.CTkFrame(bottom, fg_color="transparent")
+        actions.pack(fill="x")
+        actions.grid_columnconfigure((0, 1), weight=1, uniform="session")
+        self._button(actions, "Log Out", self.logout, variant="ghost", height=36).grid(
+            row=0, column=0, sticky="ew", padx=(0, 5))
+        self._button(actions, "Exit", self.on_exit, variant="danger", height=36).grid(
+            row=0, column=1, sticky="ew", padx=(5, 0))
+
+        nav = ctk.CTkScrollableFrame(sidebar, fg_color="transparent", corner_radius=0,
+                                     scrollbar_button_color=C["sidebar"],
+                                     scrollbar_button_hover_color=C["border"])
+        nav.pack(fill="both", expand=True)
+        self._nav_section(nav, "OVERVIEW")
+        self._nav_button(nav, "dashboard", self.show_dashboard)
+        self._nav_section(nav, "LESSONS")
+        for index in range(TOTAL_LESSONS):
+            self._nav_button(nav, f"lesson-{index}", lambda i=index: self.show_lesson(i))
+        self._nav_section(nav, "REWARDS")
+        self._nav_button(nav, "certificate", self.show_certificate)
+        self._nav_section(nav, "ACCOUNT")
+        self._nav_button(nav, "profile", self.show_profile)
+        self._nav_button(nav, "settings", self.show_settings)
+
+    def _nav_section(self, parent, title):
+        ctk.CTkLabel(parent, text=title, font=self.font(10, "bold"), text_color=C["muted"],
+                     anchor="w", height=18).pack(fill="x", padx=(14, 4), pady=(12, 4))
+
+    def _nav_button(self, parent, key, command):
+        button = ctk.CTkButton(parent, text="", command=command, height=36, corner_radius=10,
+                               anchor="w", fg_color="transparent", hover_color=C["card"],
+                               text_color=C["muted"], font=self.font(13))
+        button.pack(fill="x", padx=(2, 4), pady=1)
+        self.nav_buttons[key] = button
+
+    def _nav_label(self, key):
+        if key == "dashboard":
+            return "◆   Dashboard", C["text_soft"]
+        if key == "profile":
+            return "●   My Profile", C["text_soft"]
+        if key == "settings":
+            return "⚙   Account Settings", C["text_soft"]
+        if key == "certificate":
+            if self.quest.passed == TOTAL_LESSONS:
+                return "★   Certificate", C["accent"]
+            return f"★   Certificate  ·  {self.quest.passed}/7", C["muted"]
+        index = int(key.split("-")[1])
+        title = LESSONS[index]["title"]
+        status = self.quest.status(index)
+        if status == "completed":
+            return f"✓   {title}", C["success"]
+        if status == "in_progress":
+            return f"{index + 1}    {title}", C["primary_text"]
+        return f"{index + 1}    {title}", C["muted"]
+
+    def _build_header(self, parent):
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=(28, 22), pady=(20, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.grid(row=0, column=0, sticky="w")
+        self.page_title = ctk.CTkLabel(titles, text="", font=self.font(24, "bold"),
+                                       text_color=C["text"], anchor="w", height=32)
+        self.page_title.pack(anchor="w")
+        self.page_subtitle = ctk.CTkLabel(titles, text="", font=self.font(13),
+                                          text_color=C["muted"], anchor="w", height=20)
+        self.page_subtitle.pack(anchor="w")
+
+        stats = self._card(header, fg=C["surface"], radius=14)
+        stats.grid(row=0, column=1, sticky="e")
+        rank_box = ctk.CTkFrame(stats, fg_color="transparent")
+        rank_box.pack(side="left", padx=(18, 14), pady=10)
+        ctk.CTkLabel(rank_box, text="RANK", font=self.font(10, "bold"), text_color=C["muted"],
+                     height=14, anchor="w").pack(anchor="w")
+        self.rank_label = ctk.CTkLabel(rank_box, text="", font=self.font(15, "bold"),
+                                       text_color=C["accent"], height=22, anchor="w")
+        self.rank_label.pack(anchor="w")
+
+        ctk.CTkFrame(stats, fg_color=C["border"], width=1, height=36).pack(side="left", pady=10)
+
+        progress_box = ctk.CTkFrame(stats, fg_color="transparent")
+        progress_box.pack(side="left", padx=(14, 18), pady=10)
+        self.progress_label = ctk.CTkLabel(progress_box, text="", font=self.font(10, "bold"),
+                                           text_color=C["muted"], height=14, anchor="w")
+        self.progress_label.pack(anchor="w")
+        self.progress = ctk.CTkProgressBar(progress_box, width=180, height=8, corner_radius=4,
+                                           fg_color=C["border"], progress_color=C["success"])
+        self.progress.set(0)
+        self.progress.pack(anchor="w", pady=(8, 0))
+
+    def refresh_chrome(self):
+        for key, button in self.nav_buttons.items():
+            text, color = self._nav_label(key)
+            active = key == self.current_key
+            button.configure(text=text, text_color=C["text"] if active else color,
+                             fg_color=C["card"] if active else "transparent",
+                             font=self.font(13, "bold" if active else "normal"))
+        self.rank_label.configure(text=self.quest.rank)
+        self.progress_label.configure(text=f"PROGRESS  ·  {self.quest.passed} / {TOTAL_LESSONS} COMPLETED")
+        self._animate_progress(self.quest.passed / TOTAL_LESSONS)
+
+    def _animate_progress(self, target, step=0, start=None):
+        self._animate_bar(self.progress, target, step, start)
+
+    def _animate_bar(self, bar, target, step=0, start=None):
+        try:
+            if start is None:
+                start = bar.get()
+            steps = 18
+            eased = 1 - (1 - step / steps) ** 3
+            bar.set(start + (target - start) * eased)
+        except tk.TclError:
+            return
+        if step < steps:
+            self.after(16, lambda: self._animate_bar(bar, target, step + 1, start))
+
+    def _progress_overview(self, parent, title="Overall progress"):
+        """Card with the overall progress bar and Completed / In progress / Not started legend."""
+        completed, in_progress, not_started = self.quest.counts()
+        percent = round(completed / TOTAL_LESSONS * 100)
+        card = self._card(parent, radius=16)
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=22, pady=18)
+        top = ctk.CTkFrame(inner, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkLabel(top, text=title, font=self.font(15, "bold"), text_color=C["text"],
+                     anchor="w").pack(side="left")
+        ctk.CTkLabel(top, text=f"{percent}%", font=self.font(20, "bold"), text_color=C["success"],
+                     anchor="e").pack(side="right")
+        bar = ctk.CTkProgressBar(inner, height=12, corner_radius=6, fg_color=C["border"],
+                                 progress_color=C["success"])
+        bar.set(0)
+        bar.pack(fill="x", pady=(10, 12))
+        self.after(120, lambda: self._animate_bar(bar, completed / TOTAL_LESSONS))
+        legend = ctk.CTkFrame(inner, fg_color="transparent")
+        legend.pack(fill="x")
+        for text, color in ((f"{completed} Completed", C["success"]),
+                            (f"{in_progress} In progress", C["primary_text"]),
+                            (f"{not_started} Not started", C["muted"])):
+            item = ctk.CTkFrame(legend, fg_color="transparent")
+            item.pack(side="left", padx=(0, 22))
+            ctk.CTkLabel(item, text="", width=10, height=10, corner_radius=5,
+                         fg_color=color).pack(side="left")
+            ctk.CTkLabel(item, text=text, font=self.font(12, "bold"), text_color=C["text_soft"],
+                         height=18).pack(side="left", padx=(7, 0))
+        return card
+
+    def _show_page(self, key, title, subtitle, builder):
+        self.current_key = key
+        self.page_title.configure(text=title)
+        self.page_subtitle.configure(text=subtitle)
+        if self.scroll is not None:
+            self.scroll.destroy()
+        self._wrap_targets = []
+        self.scroll = ctk.CTkScrollableFrame(self.body, fg_color=C["bg"], corner_radius=0,
+                                             scrollbar_button_color=C["border"],
+                                             scrollbar_button_hover_color=C["muted"])
+        self.scroll.pack(fill="both", expand=True)
+        page = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        page.pack(fill="x", padx=(28, 16), pady=(6, 36))
+        builder(page)
+        self.refresh_chrome()
+        self.after(20, lambda: self._update_wrap(self.body.winfo_width()))
+
+    # ---------------------------------------------------------------
+    #  Dashboard
+    # ---------------------------------------------------------------
+
+    def show_dashboard(self):
+        self._show_page("dashboard", f"Welcome, {self.quest.player}!",
+                        "Choose any lesson you like.", self._build_dashboard)
+
+    def _build_dashboard(self, page):
+        quest = self.quest
+        next_index = quest.next_unpassed()
+        resuming = (quest.current_lesson is not None and quest.status(quest.current_lesson) == "in_progress")
+        if resuming:
+            next_index = quest.current_lesson
+
+        hero = self._card(page, fg=C["surface"], radius=20)
+        hero.pack(fill="x")
+        hero.grid_columnconfigure(0, weight=1)
+        left = ctk.CTkFrame(hero, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=28, pady=26)
+
+        greeting = ctk.CTkFrame(left, fg_color="transparent")
+        greeting.pack(anchor="w", pady=(0, 16))
+        self._avatar(greeting, 40, ring=True).pack(side="left")
+        ctk.CTkLabel(greeting, text=f"Signed in as @{quest.username}  ·  Progress saves automatically",
+                     font=self.font(12), text_color=C["muted"]).pack(side="left", padx=12)
+
+        if next_index is None:
+            eyebrow, heading = "QUEST COMPLETE", "You conquered every lesson!"
+            detail = "Your Python Master certificate is unlocked and waiting for you."
+            action = self._button(left, "View Certificate", self.show_certificate, "accent", width=200)
+        else:
+            eyebrow = "CONTINUE WHERE YOU LEFT OFF" if resuming else "UP NEXT"
+            heading = f"Lesson {next_index + 1}: {LESSONS[next_index]['title']}"
+            detail = (LESSONS[next_index]["summary"] + " Get a perfect quiz score to earn the badge.")
+            label = "Resume Lesson" if resuming else ("Start Lesson" if quest.passed == 0 else "Continue Journey")
+            action = self._button(left, label, lambda: self.show_lesson(next_index), width=200)
+
+        ctk.CTkLabel(left, text=eyebrow, font=self.font(11, "bold"), text_color=C["accent"],
+                     height=16, anchor="w").pack(anchor="w")
+        self._text(left, heading, 22, "bold", inset=380).pack(anchor="w", fill="x", pady=(6, 4))
+        self._text(left, detail, 14, color=C["muted"], inset=380).pack(anchor="w", fill="x", pady=(0, 18))
+        action.pack(anchor="w")
+
+        right = ctk.CTkFrame(hero, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="e", padx=32, pady=26)
+        ctk.CTkLabel(right, text=f"{quest.passed}/{TOTAL_LESSONS}", font=self.font(46, "bold"),
+                     text_color=C["text"]).pack()
+        ctk.CTkLabel(right, text="LESSONS PASSED", font=self.font(11, "bold"),
+                     text_color=C["muted"], height=16).pack()
+
+        stats = ctk.CTkFrame(page, fg_color="transparent")
+        stats.pack(fill="x", pady=(16, 0))
+        stats.grid_columnconfigure((0, 1, 2), weight=1, uniform="stats")
+
+        if quest.passed < 4:
+            rank_detail = f"{4 - quest.passed} more lesson(s) to reach Coder"
+        elif quest.passed < 7:
+            rank_detail = f"{7 - quest.passed} more lesson(s) to reach Python Master"
+        else:
+            rank_detail = "Highest rank achieved"
+
+        if quest.passed < TOTAL_LESSONS:
+            cert_value, cert_detail = "Locked", "Pass all 7 lessons to unlock"
+        elif quest.cert_sent:
+            cert_value, cert_detail = "Emailed", f"Sent to {quest.email}"
+        else:
+            cert_value, cert_detail = "Unlocked", "Open it from the sidebar"
+
+        cards = [
+            ("LESSONS PASSED", f"{quest.passed} of {TOTAL_LESSONS}",
+             "All complete" if quest.passed == TOTAL_LESSONS else f"{TOTAL_LESSONS - quest.passed} remaining",
+             C["text"]),
+            ("CURRENT RANK", quest.rank, rank_detail, C["accent"]),
+            ("CERTIFICATE", cert_value, cert_detail,
+             C["success"] if quest.passed == TOTAL_LESSONS else C["text"]),
+        ]
+        for column, (caption, value, detail, color) in enumerate(cards):
+            card = self._card(stats, radius=16)
+            card.grid(row=0, column=column, sticky="nsew",
+                      padx=(0 if column == 0 else 8, 0 if column == 2 else 8))
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="both", padx=20, pady=16)
+            ctk.CTkLabel(inner, text=caption, font=self.font(10, "bold"), text_color=C["muted"],
+                         height=14, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(inner, text=value, font=self.font(20, "bold"), text_color=color,
+                         height=30, anchor="w").pack(anchor="w", pady=(4, 0))
+            self._text(inner, detail, 12, color=C["muted"], inset=160, columns=3).pack(anchor="w", fill="x")
+
+        self._progress_overview(page).pack(fill="x", pady=(16, 0))
+
+        ctk.CTkLabel(page, text="All lessons", font=self.font(17, "bold"), text_color=C["text"],
+                     anchor="w").pack(anchor="w", pady=(24, 4))
+
+        grid = ctk.CTkFrame(page, fg_color="transparent")
+        grid.pack(fill="x")
+        grid.grid_columnconfigure((0, 1), weight=1, uniform="lessons")
+        for index, lesson in enumerate(LESSONS):
+            self._lesson_card(grid, index, lesson).grid(
+                row=index // 2, column=index % 2, sticky="nsew",
+                padx=(0, 8) if index % 2 == 0 else (8, 0), pady=8)
+
+    def _lesson_card(self, parent, index, lesson):
+        status = self.quest.status(index)
+        passed = status == "completed"
+        border = {"completed": C["success"], "in_progress": C["primary"]}.get(status)
+        icon_bg, icon_fg = {"completed": (C["success_soft"], C["success"]),
+                            "in_progress": (C["primary_soft"], C["primary_text"])}.get(
+            status, (C["border"], C["muted"]))
+        card = self._card(parent, border=border)
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=20, pady=18)
+
+        top = ctk.CTkFrame(inner, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkLabel(top, text="✓" if passed else str(index + 1), width=38, height=38, corner_radius=10,
+                     fg_color=icon_bg, text_color=icon_fg, font=self.font(15, "bold")).pack(side="left")
+        self._status_pill(top, index).pack(side="right")
+
+        ctk.CTkLabel(inner, text=lesson["title"], font=self.font(16, "bold"), text_color=C["text"],
+                     anchor="w").pack(anchor="w", fill="x", pady=(12, 0))
+        self._text(inner, lesson["summary"], 13, color=C["muted"], inset=190, columns=2).pack(
+            anchor="w", fill="x", pady=(2, 12))
+
+        bottom = ctk.CTkFrame(inner, fg_color="transparent")
+        bottom.pack(fill="x", side="bottom")
+        row = self.quest.progress_rows.get(index)
+        meta = f"{len(lesson['quiz'])} quiz questions"
+        if row and row["attempts"]:
+            meta += f"  ·  best {row['best_score']}/{row['total_questions']}"
+        ctk.CTkLabel(bottom, text=meta, font=self.font(12), text_color=C["muted"]).pack(side="left")
+        button_text = {"completed": "Review", "in_progress": "Continue"}.get(status, "Open Lesson")
+        self._button(bottom, button_text, lambda: self.show_lesson(index),
+                     variant="ghost" if passed else "primary", width=120, height=34).pack(side="right")
+        return card
+
+    # ---------------------------------------------------------------
+    #  Lesson page
+    # ---------------------------------------------------------------
+
+    def show_lesson(self, index):
+        lesson = LESSONS[index]
+        self._autosave_lesson_opened(index)
+        self._show_page(f"lesson-{index}", f"Lesson {index + 1}: {lesson['title']}", lesson["summary"],
+                        lambda page: self._build_lesson(page, index))
+
+    def _build_lesson(self, page, index):
+        lesson = LESSONS[index]
+
+        meta = ctk.CTkFrame(page, fg_color="transparent")
+        meta.pack(fill="x", pady=(0, 10))
+        self._pill(meta, f"LESSON {index + 1} OF {TOTAL_LESSONS}", C["primary_soft"],
+                   C["primary_text"]).pack(side="left")
+        self._status_pill(meta, index).pack(side="left", padx=8)
+
+        content = self._card(page, radius=20)
+        content.pack(fill="x")
+        inner = ctk.CTkFrame(content, fg_color="transparent")
+        inner.pack(fill="x", padx=30, pady=26)
+        for position, block in enumerate(lesson["blocks"]):
+            self._render_block(inner, block, first=position == 0)
+
+        bar = self._card(page, fg=C["surface"], radius=18)
+        bar.pack(fill="x", pady=(16, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        text = ctk.CTkFrame(bar, fg_color="transparent")
+        text.grid(row=0, column=0, sticky="w", padx=24, pady=18)
+        ctk.CTkLabel(text, text="What do you want to do?", font=self.font(16, "bold"),
+                     text_color=C["text"], height=22, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(text, text=f"{len(lesson['quiz'])} questions · a perfect score earns the badge",
+                     font=self.font(13), text_color=C["muted"], height=18, anchor="w").pack(anchor="w")
+        buttons = ctk.CTkFrame(bar, fg_color="transparent")
+        buttons.grid(row=0, column=1, sticky="e", padx=20, pady=18)
+        self._button(buttons, "Back to Menu", self.show_dashboard, "ghost", width=140).pack(side="left", padx=(0, 10))
+        self._button(buttons, "Take the Quiz", lambda: self.show_quiz(index), width=150).pack(side="left")
+
+    def _render_block(self, parent, block, first=False):
+        kind = block["type"]
+        if kind == "h":
+            self._text(parent, block["text"], 17, "bold", inset=210).pack(
+                anchor="w", fill="x", pady=(0 if first else 20, 6))
+        elif kind == "p":
+            self._text(parent, block["text"], 14, color=C["text_soft"], inset=210).pack(
+                anchor="w", fill="x", pady=(0, 4))
+        elif kind == "bullets":
+            for item in block["items"]:
+                row = ctk.CTkFrame(parent, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+                ctk.CTkLabel(row, text="•", width=18, font=self.font(16, "bold"),
+                             text_color=C["accent"]).pack(side="left", anchor="n")
+                self._text(row, item, 14, color=C["text_soft"], inset=240).pack(side="left", fill="x")
+        elif kind == "code":
+            self._code_block(parent, block)
+        elif kind == "table":
+            self._table(parent, block)
+        elif kind == "try":
+            self._try_it_block(parent)
+
+    def _code_block(self, parent, block):
+        tone = {"good": C["success"], "bad": C["error"]}.get(block.get("tone"))
+        box = ctk.CTkFrame(parent, fg_color=C["code_bg"], corner_radius=12, border_width=1,
+                           border_color=tone or C["border"])
+        box.pack(fill="x", pady=8)
+        if block.get("label"):
+            ctk.CTkLabel(box, text=block["label"], font=self.font(10, "bold"), height=14,
+                         text_color=tone or C["muted"], anchor="w").pack(anchor="w", padx=18, pady=(12, 0))
+        ctk.CTkLabel(box, text=block["code"], font=self.font(13, kind="mono"), text_color=C["text"],
+                     justify="left", anchor="w").pack(anchor="w", fill="x", padx=18,
+                                                      pady=(6 if block.get("label") else 12, 12))
+        if block.get("output") is not None:
+            ctk.CTkFrame(box, fg_color=C["border"], height=1).pack(fill="x", padx=1)
+            ctk.CTkLabel(box, text="OUTPUT", font=self.font(10, "bold"), text_color=C["muted"],
+                         height=14, anchor="w").pack(anchor="w", padx=18, pady=(10, 0))
+            ctk.CTkLabel(box, text=block["output"], font=self.font(13, kind="mono"),
+                         text_color=C["error"] if block.get("tone") == "bad" else C["output"],
+                         justify="left", anchor="w").pack(anchor="w", fill="x", padx=18, pady=(4, 12))
+
+    def _table(self, parent, block):
+        box = ctk.CTkFrame(parent, fg_color=C["code_bg"], corner_radius=12, border_width=1,
+                           border_color=C["border"])
+        box.pack(fill="x", pady=8)
+        grid = ctk.CTkFrame(box, fg_color="transparent")
+        grid.pack(fill="x", padx=8, pady=8)
+        mono_columns = block.get("mono", set())
+        for column, header in enumerate(block["headers"]):
+            grid.grid_columnconfigure(column, weight=1)
+            ctk.CTkLabel(grid, text=header.upper(), font=self.font(10, "bold"), text_color=C["muted"],
+                         anchor="w").grid(row=0, column=column, sticky="ew", padx=10, pady=(2, 4))
+        for row_number, row in enumerate(block["rows"], start=1):
+            stripe = C["surface"] if row_number % 2 else "transparent"
+            for column, value in enumerate(row):
+                is_mono = column in mono_columns
+                ctk.CTkLabel(grid, text=value, fg_color=stripe, corner_radius=0, anchor="w",
+                             font=self.font(13, kind="mono" if is_mono else "ui"),
+                             text_color=C["primary_text"] if is_mono and column == 0 else C["text_soft"]
+                             ).grid(row=row_number, column=column, sticky="nsew", ipadx=10, ipady=3)
+
+    def _try_it_block(self, parent):
+        box = ctk.CTkFrame(parent, fg_color=C["primary_soft"], corner_radius=14, border_width=1,
+                           border_color=C["primary"])
+        box.pack(fill="x", pady=(14, 4))
+        inner = ctk.CTkFrame(box, fg_color="transparent")
+        inner.pack(fill="x", padx=20, pady=16)
+        ctk.CTkLabel(inner, text="TRY THE FIRST LINE YOURSELF", font=self.font(10, "bold"),
+                     text_color=C["primary_text"], height=14, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(inner, text='name = input("Enter your name: ")', font=self.font(13, kind="mono"),
+                     text_color=C["text"], anchor="w").pack(anchor="w", pady=(6, 10))
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack(fill="x")
+        entry = self._entry(row, "Enter your name:", width=300)
+        entry.pack(side="left")
+        output = ctk.CTkLabel(inner, text="", font=self.font(14, "bold", "mono"),
+                              text_color=C["output"], anchor="w", height=0)
+
+        def run():
+            output.configure(text=f"Student: {entry.get()}", height=28)
+            if not output.winfo_ismapped():
+                output.pack(anchor="w", pady=(10, 0))
+
+        self._button(row, "Run", run, width=90, height=44).pack(side="left", padx=10)
+        entry.bind("<Return>", lambda _e: run())
+
+    # ---------------------------------------------------------------
+    #  Quiz page
+    # ---------------------------------------------------------------
+
+    def show_quiz(self, index):
+        lesson = LESSONS[index]
+        self._autosave_lesson_opened(index)
+        self._show_page(f"lesson-{index}", f"Lesson {index + 1} Quiz", lesson["title"],
+                        lambda page: self._build_quiz(page, index))
+
+    def _build_quiz(self, page, index):
+        lesson = LESSONS[index]
+        questions = lesson["quiz"]
+        self.quiz_items = []
+        self.quiz_done = False
+
+        intro = self._card(page, fg=C["surface"], radius=18)
+        intro.pack(fill="x", pady=(0, 8))
+        intro_inner = ctk.CTkFrame(intro, fg_color="transparent")
+        intro_inner.pack(fill="x", padx=24, pady=18)
+        ctk.CTkLabel(intro_inner, text=f"LESSON {index + 1} QUIZ", font=self.font(11, "bold"),
+                     text_color=C["accent"], height=16, anchor="w").pack(anchor="w")
+        self._text(intro_inner, f"Answer all {len(questions)} questions. You need a perfect score "
+                                f"({len(questions)} out of {len(questions)}) to pass the lesson and earn the badge.",
+                   14, color=C["text_soft"], inset=210).pack(anchor="w", fill="x", pady=(4, 0))
+        if lesson.get("quiz_note"):
+            ctk.CTkLabel(intro_inner, text=f"Note: {lesson['quiz_note']}", font=self.font(13, "bold"),
+                         text_color=C["primary_text"], anchor="w").pack(anchor="w", pady=(8, 0))
+
+        for number, question in enumerate(questions, start=1):
+            card = self._card(page, radius=16)
+            card.pack(fill="x", pady=8)
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="x", padx=24, pady=20)
+            ctk.CTkLabel(inner, text=f"QUESTION {number} OF {len(questions)}", font=self.font(10, "bold"),
+                         text_color=C["muted"], height=14, anchor="w").pack(anchor="w")
+            self._text(inner, question["prompt"], 15, "bold", inset=230).pack(anchor="w", fill="x", pady=(4, 0))
+            if question.get("code"):
+                ctk.CTkLabel(inner, text=f"  {question['code']}  ", font=self.font(14, kind="mono"),
+                             fg_color=C["code_bg"], corner_radius=8, text_color=C["primary_text"],
+                             height=34).pack(anchor="w", pady=(10, 0))
+
+            if question.get("options"):
+                variable = ctk.StringVar(value="")
+                widgets = []
+                for option_number, option_text in enumerate(question["options"], start=1):
+                    radio = ctk.CTkRadioButton(
+                        inner, text=option_text, variable=variable, value=str(option_number),
+                        font=self.font(14), text_color=C["text_soft"], fg_color=C["primary"],
+                        hover_color=C["primary_hover"], border_color=C["muted"],
+                        text_color_disabled=C["muted"])
+                    radio.pack(anchor="w", pady=(10 if option_number == 1 else 4, 4))
+                    widgets.append(radio)
+                getter = variable.get
+            else:
+                entry = self._entry(inner, question.get("placeholder", "Type your answer"), width=340)
+                entry.pack(anchor="w", pady=(12, 0))
+                entry.bind("<Return>", lambda _e: self._submit_quiz(index))
+                widgets = [entry]
+                getter = entry.get
+
+            self.quiz_items.append({"card": card, "inner": inner, "get": getter,
+                                    "widgets": widgets, "question": question})
+
+        self.quiz_footer = ctk.CTkFrame(page, fg_color="transparent")
+        self.quiz_footer.pack(fill="x", pady=(12, 0))
+        ctk.CTkLabel(self.quiz_footer, text="You can retake the quiz as many times as you like.",
+                     font=self.font(12), text_color=C["muted"]).pack(side="left")
+        self._button(self.quiz_footer, "Submit Answers", lambda: self._submit_quiz(index),
+                     width=170, height=44).pack(side="right")
+        self._button(self.quiz_footer, "Back to Lesson", lambda: self.show_lesson(index),
+                     "ghost", width=150, height=44).pack(side="right", padx=10)
+
+    def _submit_quiz(self, index):
+        if self.quiz_done:
+            return
+        missing = 0
+        for item in self.quiz_items:
+            unanswered = item["get"]().strip() == ""
+            missing += unanswered
+            item["card"].configure(border_color=C["error"] if unanswered else C["border"])
+        if missing:
+            self.toast(f"Please answer every question first ({missing} left).", "error")
+            return
+
+        self.quiz_done = True
+        score = 0
+        for item in self.quiz_items:
+            question = item["question"]
+            correct = item["get"]().strip() in question["answer"]
+            score += correct
+            if correct:
+                message = "✓  Correct!"
+            else:
+                message = "✗  Wrong." + (f" Hint: {question['hint']}" if question.get("hint") else "")
+            feedback = self._text(item["inner"], message, 13, "bold", inset=260,
+                                  color=C["success"] if correct else C["error"],
+                                  fg_color=C["success_soft"] if correct else C["error_soft"],
+                                  corner_radius=8)
+            feedback.pack(anchor="w", fill="x", pady=(14, 0), ipadx=10, ipady=4)
+            item["card"].configure(border_color=C["success"] if correct else C["error"])
+            for widget in item["widgets"]:
+                widget.configure(state="disabled")
+
+        self._show_quiz_result(index, score, len(self.quiz_items))
+        self.after(20, lambda: self._update_wrap(self.body.winfo_width()))
+
+    def _show_quiz_result(self, index, score, total):
+        for child in self.quiz_footer.winfo_children():
+            child.destroy()
+
+        perfect = score == total
+        card = self._card(self.quiz_footer, fg=C["success_soft"] if perfect else C["surface"],
+                          border=C["success"] if perfect else C["border"], radius=18)
+        card.pack(fill="x")
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=26, pady=22)
+        inner.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(inner, text=f"{score}/{total}", font=self.font(40, "bold"),
+                     text_color=C["success"] if perfect else C["accent"]).grid(
+            row=0, column=0, rowspan=2, sticky="w", padx=(0, 24))
+
+        buttons = ctk.CTkFrame(inner, fg_color="transparent")
+        buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(16, 0))
+
+        old_rank = self.quest.rank
+        newly_passed = perfect and not self.quest.is_passed(index)
+        self._autosave_quiz(index, score, total)
+        if perfect:
+            self.quest.mark_passed(index)
+            title = f"PERFECT! Lesson {index + 1} passed. Badge earned!"
+            detail = f"Score: {score} out of {total}. You have passed {self.quest.passed} of 7 lessons."
+            if not newly_passed:
+                detail += " (You already had this badge — great review!)"
+            self._button(buttons, "Back to Menu", self.show_dashboard, "ghost", width=150).pack(side="left", padx=(0, 10))
+            next_index = self.quest.next_unpassed(index + 1)
+            if next_index is None:
+                self._button(buttons, "View Certificate", self.show_certificate, "accent", width=180).pack(side="left")
+            else:
+                self._button(buttons, f"Next: Lesson {next_index + 1}",
+                             lambda: self.show_lesson(next_index), width=180).pack(side="left")
+            self.refresh_chrome()
+            if self.quest.rank != old_rank:
+                self.toast(f"Rank up! You are now a {self.quest.rank}.", "success")
+            self.check_auto_certificate()
+        else:
+            title = f"Score: {score} out of {total}"
+            row = self.quest.progress_rows.get(index)
+            best = f" Best so far: {row['best_score']}/{total}." if row else ""
+            detail = f"Not perfect yet — this attempt was saved.{best} What do you want to do?"
+            self.refresh_chrome()
+            self._button(buttons, "Retake the Quiz", lambda: self.show_quiz(index), width=160).pack(side="left", padx=(0, 10))
+            self._button(buttons, "Review the Lesson", lambda: self.show_lesson(index), "ghost", width=170).pack(side="left", padx=(0, 10))
+            self._button(buttons, "Back to Menu", self.show_dashboard, "ghost", width=150).pack(side="left")
+
+        self._text(inner, title, 18, "bold", inset=330,
+                   color=C["success"] if perfect else C["text"]).grid(row=0, column=1, sticky="sw")
+        self._text(inner, detail, 13, color=C["text_soft"], inset=330).grid(row=1, column=1, sticky="nw")
+        self.after(80, self._scroll_to_bottom)
+
+    # ---------------------------------------------------------------
+    #  Certificate: PDF, save, preview, delivery
+    # ---------------------------------------------------------------
+
+    def get_pdf(self):
+        """Return the certificate PDF bytes, regenerating only when the certificate data changed."""
+        quest = self.quest
+        key = (quest.player, quest.rank, quest.passed, datetime.date.today().isoformat())
+        if self._pdf_cache is None or self._pdf_cache[0] != key:
+            data = build_certificate_pdf(quest.player, quest.rank, quest.passed, TOTAL_LESSONS)
+            self._pdf_cache = (key, data)
+            quest.pdf_generated = True
+        return self._pdf_cache[1]
+
+    def check_auto_certificate(self):
+        """Send automatically after the 7th lesson only when the app-wide Gmail sender is configured."""
+        quest = self.quest
+        sender_address, sender_password = get_gmail_sender_config()
+        if (quest.passed == TOTAL_LESSONS and quest.email and sender_address and sender_password
+                and not quest.cert_sent and not self.sending):
+            self.toast(f"You passed ALL lessons! Sending your certificate PDF to {quest.email} ...", "info")
+            self.send_certificate_async()
+
+    def send_certificate_async(self):
+        quest = self.quest
+        if self.sending or not quest.email:
+            return
+        try:
+            pdf_bytes = self.get_pdf()
+        except Exception as exc:
+            quest.last_error = f"Could not generate the PDF ({exc})"
+            self.toast(quest.last_error, "error", 6000)
+            self._render_cert_actions()
+            return
+        filename = certificate_filename(quest.player)
+
+        sender_address, sender_password = get_gmail_sender_config()
+        if not sender_address or not sender_password:
+            quest.last_error = (
+                "Gmail sender is not configured. Set PYTHON_JOURNEY_GMAIL_ADDRESS and "
+                "PYTHON_JOURNEY_GMAIL_APP_PASSWORD in Windows environment variables."
+            )
+            self._render_cert_actions()
+            self.toast(quest.last_error, "error", 7000)
+            return
+
+        self.sending = True
+        quest.last_error = None
+        self._render_cert_actions()
+        self.toast(f"Sending certificate from {sender_address} to {quest.email}...", "info", 5000)
+
+        def work():
+            return send_certificate(sender_address, sender_password, quest.email,
+                                    quest.player, pdf_bytes, filename)
+
+        def done(result, error):
+            self.sending = False
+            if error is not None:
+                sent, message = False, f"Something went wrong: {error}"
+            else:
+                sent, message = result
+            if sent:
+                quest.cert_sent = True
+                quest.last_error = None
+                self.toast(message, "success")
+                if quest is self.quest:
+                    self._sync_state()
+            else:
+                quest.last_error = message
+                self.toast(f"{message} Not sent. You can try again from the Certificate page.", "error", 7000)
+            self._render_cert_actions()
+            if self.current_key == "dashboard":
+                self.show_dashboard()
+
+        self.run_in_background(work, done)
+
+    def show_certificate(self):
+        unlocked = self.quest.passed == TOTAL_LESSONS
+        subtitle = ("Officially certified as a PYTHON MASTER." if unlocked
+                    else "Unlocked after all 7 lessons are passed.")
+        self._show_page("certificate", "Your Certificate", subtitle, self._build_certificate)
+        sender_address, sender_password = get_gmail_sender_config()
+        if (unlocked and self.quest.email and sender_address and sender_password
+                and not self.quest.cert_sent and not self.sending):
+            self.toast(f"Sending PDF to {self.quest.email} ...", "info")
+            self.send_certificate_async()
+
+    def _build_certificate(self, page):
+        self.cert_actions = None
+        if self.quest.passed < TOTAL_LESSONS:
+            self._build_locked_certificate(page)
+            return
+
+        # Generate the PDF up front so "PDF Generated" is accurate and errors show early.
+        pdf_error = None
+        try:
+            self.get_pdf()
+        except Exception as exc:
+            pdf_error = str(exc)
+            self.quest.pdf_generated = False
+
+        player = self.quest.player
+        frame = ctk.CTkFrame(page, fg_color=C["cert_gold"], corner_radius=22)
+        frame.pack(fill="x")
+        paper = ctk.CTkFrame(frame, fg_color=C["cert_bg"], corner_radius=18)
+        paper.pack(fill="both", padx=5, pady=5)
+        border = ctk.CTkFrame(paper, fg_color="transparent", border_width=1,
+                              border_color=C["cert_gold"], corner_radius=14)
+        border.pack(fill="both", padx=16, pady=16)
+        content = ctk.CTkFrame(border, fg_color="transparent")
+        content.pack(fill="both", padx=44, pady=34)
+
+        ctk.CTkLabel(content, text="ACT  ·  PYTHON QUEST", font=self.font(11, "bold"),
+                     text_color=C["cert_gold"]).pack()
+        ctk.CTkLabel(content, text="CERTIFICATE OF COMPLETION", font=self.font(28, "bold", "serif"),
+                     text_color=C["cert_text"]).pack(pady=(8, 0))
+        ctk.CTkLabel(content, text="Proudly presented to", font=self.font(14, kind="serif", slant="italic"),
+                     text_color="#6B7280").pack(pady=(14, 0))
+        self._text(content, player, 34, "bold", kind="serif", color=C["cert_name"], inset=260,
+                   justify="center", anchor="center").pack(pady=(2, 6))
+        ctk.CTkFrame(content, fg_color=C["cert_gold"], height=2, width=240).pack(pady=(0, 18))
+
+        for paragraph in certificate_paragraphs(player):
+            self._text(content, paragraph, 14, kind="serif", color="#374151", inset=300,
+                       justify="center", anchor="center").pack(fill="x", pady=6)
+
+        footer = ctk.CTkFrame(content, fg_color="transparent")
+        footer.pack(fill="x", pady=(24, 0))
+        footer.grid_columnconfigure((0, 1, 2), weight=1, uniform="cert")
+        # The same helper feeds the PDF, so preview and PDF always agree.
+        for column, (caption, value) in enumerate(
+                certificate_details(self.quest.rank, self.quest.passed, TOTAL_LESSONS)):
+            cell = ctk.CTkFrame(footer, fg_color="transparent")
+            cell.grid(row=0, column=column)
+            ctk.CTkLabel(cell, text=caption, font=self.font(10, "bold"), text_color=C["cert_gold"],
+                         height=14).pack()
+            ctk.CTkLabel(cell, text=value, font=self.font(14, "bold", "serif"),
+                         text_color=C["cert_text"]).pack()
+
+        self.cert_actions = self._card(page, radius=18)
+        self.cert_actions.pack(fill="x", pady=(16, 0))
+        self._render_cert_actions(pdf_error=pdf_error)
+
+    def _render_cert_actions(self, pdf_error=None):
+        holder = self.cert_actions
+        if holder is None or not holder.winfo_exists():
+            return
+        for child in holder.winfo_children():
+            child.destroy()
+
+        quest = self.quest
+        holder.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(holder, text="Delivery", font=self.font(16, "bold"), text_color=C["text"],
+                     height=22, anchor="w").grid(row=0, column=0, sticky="w", padx=24, pady=(18, 4))
+
+        # --- status text ---
+        if pdf_error:
+            status, color = f"PDF problem: {pdf_error}", C["error"]
+        elif not quest.email:
+            status, color = ("You played without email. Save the PDF or copy your certificate instead.",
+                             C["muted"])
+        elif self.sending:
+            status, color = f"Sending the PDF to {quest.email} ...", C["primary_text"]
+        elif quest.cert_sent:
+            status, color = (f"Certificate PDF sent to {quest.email}! Check your inbox (and the Spam folder).",
+                             C["success"])
+        elif quest.last_error:
+            status, color = f"{quest.last_error} Not sent yet.", C["error"]
+        elif get_gmail_sender_config()[0] and get_gmail_sender_config()[1]:
+            status, color = f"Ready to send from {get_gmail_sender_config()[0]} to {quest.email}.", C["muted"]
+        else:
+            status, color = ("Gmail sender is not configured. Add the sender address and App Password "
+                             "in Windows environment variables, then restart the app.", C["muted"])
+        self._text(holder, status, 13, color=color, inset=120).grid(
+            row=1, column=0, sticky="ew", padx=24, pady=(0, 10))
+
+        # --- status chips: green on success, red on error ---
+        chips = ctk.CTkFrame(holder, fg_color="transparent")
+        chips.grid(row=2, column=0, sticky="w", padx=24, pady=(0, 12))
+
+        if pdf_error:
+            self._pill(chips, "✗ PDF FAILED", C["error_soft"], C["error"]).pack(side="left", padx=(0, 8))
+        elif quest.pdf_generated:
+            self._pill(chips, "✓ PDF GENERATED", C["success_soft"], C["success"]).pack(side="left", padx=(0, 8))
+        else:
+            self._pill(chips, "PDF GENERATED", C["primary_soft"], C["muted"]).pack(side="left", padx=(0, 8))
+
+        if quest.pdf_saved:
+            self._pill(chips, "✓ PDF SAVED", C["success_soft"], C["success"]).pack(side="left", padx=(0, 8))
+        else:
+            self._pill(chips, "PDF SAVED", C["primary_soft"], C["muted"]).pack(side="left", padx=(0, 8))
+
+        if quest.cert_sent:
+            self._pill(chips, "✓ EMAIL SENT", C["success_soft"], C["success"]).pack(side="left")
+        elif quest.last_error and quest.email and not self.sending:
+            self._pill(chips, "✗ EMAIL FAILED", C["error_soft"], C["error"]).pack(side="left")
+        elif self.sending:
+            self._pill(chips, "SENDING...", C["primary_soft"], C["primary_text"]).pack(side="left")
+        else:
+            self._pill(chips, "EMAIL SENT", C["primary_soft"], C["muted"]).pack(side="left")
+
+        # --- buttons: Preview, Save as PDF, Copy text, Send via Gmail ---
+        buttons = ctk.CTkFrame(holder, fg_color="transparent")
+        buttons.grid(row=3, column=0, sticky="w", padx=24, pady=(0, 18))
+        self._button(buttons, "Preview Certificate", self._preview_certificate, "ghost", width=170).pack(
+            side="left", padx=(0, 8))
+        self._button(buttons, "Save as PDF", self._save_pdf, "primary", width=130).pack(side="left", padx=(0, 8))
+        self._button(buttons, "Copy Certificate Text", self._copy_certificate, "ghost", width=190).pack(
+            side="left", padx=(0, 8))
+        if quest.email:
+            if self.sending:
+                send = self._button(buttons, "Sending...", None, width=160)
+                send.configure(state="disabled")
+            elif quest.cert_sent:
+                send = self._button(buttons, "Sent ✓", None, width=160)
+                send.configure(state="disabled", fg_color=C["success_soft"], text_color_disabled=C["success"])
+            else:
+                send = self._button(buttons, "Send via Gmail", self.send_certificate_async, "accent", width=160)
+            send.pack(side="left", padx=(0, 8))
+        self._button(buttons, "Save as .txt", self._save_certificate, "ghost", width=120).pack(side="left")
+
+        self.after(10, lambda: self._update_wrap(self.body.winfo_width()))
+
+    def _preview_certificate(self):
+        """Open the real PDF in the system viewer so the user sees exactly what will be saved/sent."""
+        try:
+            data = self.get_pdf()
+            if self._temp_preview is None:
+                handle = tempfile.NamedTemporaryFile(prefix="python_journey_preview_", suffix=".pdf",
+                                                     delete=False)
+                handle.close()
+                self._temp_preview = handle.name
+            with open(self._temp_preview, "wb") as out:
+                out.write(data)
+            webbrowser.open(Path(self._temp_preview).as_uri())
+            self.toast("Opening the certificate PDF preview...", "info")
+        except Exception as exc:
+            self.quest.pdf_generated = False
+            self.toast(f"Could not create the preview: {exc}", "error", 6000)
+        self._render_cert_actions()
+
+    def _save_pdf(self):
+        quest = self.quest
+        try:
+            data = self.get_pdf()
+        except Exception as exc:
+            self.toast(f"Could not generate the PDF: {exc}", "error", 6000)
+            self._render_cert_actions(pdf_error=str(exc))
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save certificate as PDF", defaultextension=".pdf",
+            initialfile=certificate_filename(quest.player),
+            filetypes=[("PDF document", "*.pdf"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            self.toast(f"Could not save the PDF: {exc}", "error", 6000)
+            messagebox.showerror("Could not save", f"The PDF could not be saved:\n{exc}")
+            return
+        quest.pdf_saved = True
+        self._sync_state(silent=True)
+        self.toast(f"PDF saved: {Path(path).name}", "success")
+        self._render_cert_actions()
+
+    def _copy_certificate(self):
+        self.clipboard_clear()
+        self.clipboard_append(certificate_text(self.quest.player))
+        self.toast("Certificate text copied to the clipboard.", "success")
+
+    def _save_certificate(self):
+        safe_name = "".join(ch for ch in self.quest.player if ch.isalnum() or ch in " _-").strip() or "player"
+        path = filedialog.asksaveasfilename(
+            title="Save certificate", defaultextension=".txt",
+            initialfile=f"{safe_name.replace(' ', '_')}_Python_Certificate.txt",
+            filetypes=[("Text file", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(certificate_text(self.quest.player))
+        except OSError as exc:
+            messagebox.showerror("Could not save", f"The certificate could not be saved:\n{exc}")
+            return
+        self.toast("Certificate saved.", "success")
+
+    def _build_locked_certificate(self, page):
+        left = TOTAL_LESSONS - self.quest.passed
+        card = self._card(page, radius=20)
+        card.pack(fill="x")
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=30, pady=28)
+
+        ctk.CTkLabel(inner, text="★", width=56, height=56, corner_radius=16, fg_color=C["primary_soft"],
+                     text_color=C["accent"], font=self.font(26, "bold")).pack(anchor="w")
+        ctk.CTkLabel(inner, text="Certificate locked", font=self.font(22, "bold"),
+                     text_color=C["text"], anchor="w").pack(anchor="w", pady=(14, 0))
+        self._text(inner, f"Not yet! Pass {left} more lesson(s) to unlock your certificate.",
+                   14, color=C["text_soft"], inset=220).pack(anchor="w", fill="x")
+        bar = ctk.CTkProgressBar(inner, height=10, corner_radius=5, fg_color=C["border"],
+                                 progress_color=C["success"])
+        bar.set(self.quest.passed / TOTAL_LESSONS)
+        bar.pack(fill="x", pady=(16, 20))
+
+        for index, lesson in enumerate(LESSONS):
+            passed = self.quest.is_passed(index)
+            row = ctk.CTkFrame(inner, fg_color=C["surface"], corner_radius=12)
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text="✓" if passed else str(index + 1), width=30, height=30, corner_radius=8,
+                         fg_color=C["success_soft"] if passed else C["primary_soft"],
+                         text_color=C["success"] if passed else C["primary_text"],
+                         font=self.font(13, "bold")).pack(side="left", padx=12, pady=8)
+            ctk.CTkLabel(row, text=lesson["title"], font=self.font(14, "bold" if not passed else "normal"),
+                         text_color=C["muted"] if passed else C["text"]).pack(side="left")
+            if passed:
+                self._pill(row, "✓ PASSED", C["success_soft"], C["success"]).pack(side="right", padx=14)
+            else:
+                self._button(row, "Open", lambda i=index: self.show_lesson(i), "ghost",
+                             width=84, height=30).pack(side="right", padx=12)
+
+    # ---------------------------------------------------------------
+    #  Profile page
+    # ---------------------------------------------------------------
+
+    def show_profile(self):
+        self._show_page("profile", "My Profile", "Your account, progress and achievements.",
+                        self._build_profile)
+
+    def _build_profile(self, page):
+        quest = self.quest
+        try:
+            summary = self.db.quiz_summary(quest.user_id)
+            recent = self.db.recent_quiz_results(quest.user_id)
+        except DatabaseError as exc:
+            summary, recent = {"attempts": 0, "passed": 0}, []
+            self.toast(f"Could not load quiz history: {exc}", "error", 6000)
+
+        hero = self._card(page, fg=C["surface"], radius=20)
+        hero.pack(fill="x")
+        row = ctk.CTkFrame(hero, fg_color="transparent")
+        row.pack(fill="x", padx=28, pady=26)
+        self._avatar(row, 112, ring=True).pack(side="left", anchor="n")
+        info = ctk.CTkFrame(row, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=(24, 0))
+        ctk.CTkLabel(info, text=quest.player, font=self.font(26, "bold"), text_color=C["text"],
+                     anchor="w").pack(anchor="w")
+        handle = ctk.CTkFrame(info, fg_color="transparent")
+        handle.pack(anchor="w", pady=(2, 8))
+        ctk.CTkLabel(handle, text=f"@{quest.username}", font=self.font(14),
+                     text_color=C["primary_text"]).pack(side="left")
+        self._pill(handle, quest.rank.upper(), C["primary_soft"], C["accent"]).pack(side="left", padx=10)
+        self._text(info, quest.bio or "No bio yet. Add one in Account Settings.", 14,
+                   color=C["text_soft"] if quest.bio else C["muted"], inset=330).pack(anchor="w", fill="x")
+        dates = (f"Member since {format_date(quest.created_at)}   ·   "
+                 f"Last login {format_date(quest.last_login, with_time=True)}")
+        ctk.CTkLabel(info, text=dates, font=self.font(12), text_color=C["muted"],
+                     anchor="w").pack(anchor="w", pady=(10, 0))
+        self._button(row, "Edit Profile", self.show_settings, "ghost", width=130, height=36).pack(
+            side="right", anchor="n")
+
+        stats = ctk.CTkFrame(page, fg_color="transparent")
+        stats.pack(fill="x", pady=(16, 0))
+        stats.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="stats")
+        completed, in_progress, _ = quest.counts()
+        max_points = sum(len(lesson["quiz"]) for lesson in LESSONS)
+        earned = sum(1 for code, *_ in ACHIEVEMENTS if code in quest.achievements)
+        for column, (caption, value) in enumerate((
+                ("LESSONS COMPLETED", f"{completed}/{TOTAL_LESSONS}"),
+                ("BEST QUIZ POINTS", f"{quest.best_points()}/{max_points}"),
+                ("QUIZ ATTEMPTS", str(summary["attempts"])),
+                ("ACHIEVEMENTS", f"{earned}/{len(ACHIEVEMENTS)}"))):
+            card = self._card(stats, radius=14)
+            card.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
+            ctk.CTkLabel(card, text=caption, font=self.font(10, "bold"), text_color=C["muted"],
+                         anchor="w").pack(anchor="w", padx=18, pady=(14, 0))
+            ctk.CTkLabel(card, text=value, font=self.font(22, "bold"), text_color=C["text"],
+                         anchor="w").pack(anchor="w", padx=18, pady=(0, 14))
+
+        self._progress_overview(page, "Learning progress").pack(fill="x", pady=(16, 0))
+
+        lessons = self._card(page, radius=16)
+        lessons.pack(fill="x", pady=(16, 0))
+        ctk.CTkLabel(lessons, text="Lessons", font=self.font(15, "bold"), text_color=C["text"],
+                     anchor="w").pack(anchor="w", padx=22, pady=(18, 8))
+        for index, lesson in enumerate(LESSONS):
+            line = ctk.CTkFrame(lessons, fg_color=C["surface"], corner_radius=12)
+            line.pack(fill="x", padx=16, pady=3)
+            ctk.CTkLabel(line, text=f"{index + 1}. {lesson['title']}", font=self.font(13, "bold"),
+                         text_color=C["text"], anchor="w").pack(side="left", padx=14, pady=9)
+            self._status_pill(line, index).pack(side="right", padx=12)
+            saved = quest.progress_rows.get(index)
+            if saved and saved["attempts"]:
+                ctk.CTkLabel(line, text=f"best {saved['best_score']}/{saved['total_questions']}  ·  "
+                                        f"{saved['attempts']} attempt(s)",
+                             font=self.font(12), text_color=C["muted"]).pack(side="right", padx=6)
+        ctk.CTkFrame(lessons, fg_color="transparent", height=12).pack()
+
+        badges = self._card(page, radius=16)
+        badges.pack(fill="x", pady=(16, 0))
+        ctk.CTkLabel(badges, text="Achievements", font=self.font(15, "bold"), text_color=C["text"],
+                     anchor="w").pack(anchor="w", padx=22, pady=(18, 8))
+        grid = ctk.CTkFrame(badges, fg_color="transparent")
+        grid.pack(fill="x", padx=16, pady=(0, 16))
+        grid.grid_columnconfigure((0, 1, 2), weight=1, uniform="badge")
+        for position, (code, title, desc, icon) in enumerate(ACHIEVEMENTS):
+            earned_at = quest.achievements.get(code)
+            tile = ctk.CTkFrame(grid, fg_color=C["success_soft"] if earned_at else C["surface"],
+                                corner_radius=12, border_width=1,
+                                border_color=C["success"] if earned_at else C["border"])
+            tile.grid(row=position // 3, column=position % 3, sticky="nsew", padx=4, pady=4)
+            ctk.CTkLabel(tile, text=icon, width=34, height=34,
+                         corner_radius=9, fg_color=C["success"] if earned_at else C["border"],
+                         text_color="#0B1220" if earned_at else C["muted"],
+                         font=self.font(14, "bold")).pack(side="left", padx=(12, 10), pady=12)
+            texts = ctk.CTkFrame(tile, fg_color="transparent")
+            texts.pack(side="left", fill="x", expand=True, pady=10)
+            ctk.CTkLabel(texts, text=shorten(title, 26), font=self.font(13, "bold"),
+                         text_color=C["text"] if earned_at else C["muted"], anchor="w",
+                         height=18).pack(anchor="w")
+            ctk.CTkLabel(texts, text=f"Earned {format_date(earned_at)}" if earned_at else shorten(desc, 34),
+                         font=self.font(11), text_color=C["success"] if earned_at else C["muted"],
+                         anchor="w", height=16).pack(anchor="w")
+
+        history = self._card(page, radius=16)
+        history.pack(fill="x", pady=(16, 0))
+        ctk.CTkLabel(history, text="Recent quiz results", font=self.font(15, "bold"), text_color=C["text"],
+                     anchor="w").pack(anchor="w", padx=22, pady=(18, 8))
+        if not recent:
+            ctk.CTkLabel(history, text="No quizzes taken yet.", font=self.font(13), text_color=C["muted"],
+                         anchor="w").pack(anchor="w", padx=22, pady=(0, 18))
+        for result in recent:
+            line = ctk.CTkFrame(history, fg_color="transparent")
+            line.pack(fill="x", padx=22, pady=3)
+            index = result["lesson_index"]
+            title = LESSONS[index]["title"] if 0 <= index < TOTAL_LESSONS else f"Lesson {index + 1}"
+            ctk.CTkLabel(line, text=title, font=self.font(13), text_color=C["text"],
+                         anchor="w").pack(side="left")
+            perfect = bool(result["passed"])
+            self._pill(line, f"{result['score']}/{result['total']}",
+                       C["success_soft"] if perfect else C["border"],
+                       C["success"] if perfect else C["text_soft"]).pack(side="right")
+            ctk.CTkLabel(line, text=format_date(result["taken_at"], with_time=True), font=self.font(12),
+                         text_color=C["muted"]).pack(side="right", padx=12)
+        if recent:
+            ctk.CTkFrame(history, fg_color="transparent", height=12).pack()
+
+    # ---------------------------------------------------------------
+    #  Account settings page
+    # ---------------------------------------------------------------
+
+    def show_settings(self):
+        self._show_page("settings", "Account Settings", "Update your picture, details and password.",
+                        self._build_settings)
+
+    def _settings_section(self, page, title, detail, danger=False):
+        card = self._card(page, radius=16, border="#5B2328" if danger else None)
+        card.pack(fill="x", pady=(0, 16))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=24, pady=20)
+        ctk.CTkLabel(inner, text=title, font=self.font(16, "bold"),
+                     text_color=C["error"] if danger else C["text"], anchor="w").pack(anchor="w")
+        self._text(inner, detail, 13, color=C["muted"], inset=200).pack(anchor="w", fill="x", pady=(2, 14))
+        return inner
+
+    def _status_line(self, parent):
+        label = ctk.CTkLabel(parent, text="", font=self.font(12, "bold"), text_color=C["error"],
+                             anchor="w", height=18)
+        label.pack(anchor="w", pady=(8, 0))
+        return label
+
+    def _build_settings(self, page):
+        quest = self.quest
+
+        # --- profile picture ---
+        section = self._settings_section(
+            page, "Profile picture", "PNG, JPG or JPEG up to 10 MB. It is cropped to a circle and saved "
+                                     "only for this account.")
+        row = ctk.CTkFrame(section, fg_color="transparent")
+        row.pack(fill="x")
+        self._avatar(row, 84, ring=True).pack(side="left")
+        buttons = ctk.CTkFrame(row, fg_color="transparent")
+        buttons.pack(side="left", padx=20)
+        self._button(buttons, "Upload New Picture", self._choose_avatar, width=180, height=36).pack(
+            side="left", padx=(0, 8))
+        remove = self._button(buttons, "Remove", self._remove_avatar, "ghost", width=100, height=36)
+        remove.pack(side="left")
+        if not quest.avatar_path:
+            remove.configure(state="disabled")
+        if not PIL_OK:
+            ctk.CTkLabel(section, text="Install Pillow to use pictures:  pip install pillow",
+                         font=self.font(12, "bold"), text_color=C["error"]).pack(anchor="w", pady=(10, 0))
+
+        # --- profile details ---
+        section = self._settings_section(page, "Profile details",
+                                         "Your name appears on your certificate. Your email receives it.")
+        fields = {}
+        for key, label, value in (("full_name", "Full name", quest.player),
+                                  ("username", "Username", quest.username),
+                                  ("email", "Email", quest.email)):
+            self._field_label(section, label)
+            entry = self._entry(section, label, width=420)
+            entry.insert(0, value)
+            entry.pack(anchor="w", pady=(0, 10))
+            fields[key] = entry
+        self._field_label(section, "Bio (optional, up to 160 characters)")
+        bio = ctk.CTkTextbox(section, width=420, height=80, corner_radius=10, fg_color=C["surface"],
+                             border_color=C["border"], border_width=1, text_color=C["text"],
+                             font=self.font(14), wrap="word")
+        bio.insert("1.0", quest.bio)
+        bio.pack(anchor="w")
+        fields["bio"] = bio
+        status = self._status_line(section)
+        self._button(section, "Save Changes", lambda: self._save_profile(fields, status), width=150).pack(
+            anchor="w", pady=(10, 0))
+
+        # --- password ---
+        section = self._settings_section(page, "Change password",
+                                         "At least 8 characters with one letter and one number.")
+        passwords = {}
+        for key, label in (("current", "Current password"), ("new", "New password"),
+                           ("confirm", "Confirm new password")):
+            self._field_label(section, label)
+            entry = self._entry(section, label, show="•", width=420)
+            entry.pack(anchor="w", pady=(0, 10))
+            passwords[key] = entry
+        pw_status = self._status_line(section)
+        self._button(section, "Update Password", lambda: self._change_password(passwords, pw_status),
+                     width=170).pack(anchor="w", pady=(10, 0))
+
+        # --- Gmail sender connection (application-wide) ---
+        section = self._settings_section(
+            page, "Gmail certificate sender",
+            "The app uses one trusted sender Gmail account for all certificate emails. "
+            "Learners only provide their own recipient email during signup.")
+        sender_address, sender_password = get_gmail_sender_config()
+        configured = bool(sender_address and sender_password)
+        connection_text = (
+            f"Configured sender: {sender_address}" if configured
+            else "Not configured. Set the two environment variables listed below, then restart Python Journey."
+        )
+        connection_color = C["success"] if configured else C["error"]
+        connection_label = ctk.CTkLabel(section, text=connection_text, font=self.font(13, "bold"),
+                                        text_color=connection_color, anchor="w", wraplength=620)
+        connection_label.pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(
+            section,
+            text=("Required Windows environment variables: "
+                  "PYTHON_JOURNEY_GMAIL_ADDRESS and PYTHON_JOURNEY_GMAIL_APP_PASSWORD. "
+                  "The App Password is never shown or stored in the app database."),
+            font=self.font(12), text_color=C["muted"], anchor="w", justify="left",
+            wraplength=620).pack(anchor="w", pady=(0, 10))
+        gmail_status = self._status_line(section)
+
+        def run_gmail_test():
+            gmail_status.configure(text="Testing Gmail authentication...", text_color=C["primary_text"])
+            self.update_idletasks()
+            def worker():
+                result = test_gmail_connection()
+                self.after(0, lambda: gmail_status.configure(
+                    text=("✓ " if result[0] else "✗ ") + result[1],
+                    text_color=C["success"] if result[0] else C["error"]))
+            threading.Thread(target=worker, daemon=True).start()
+
+        self._button(section, "Test Gmail Connection", run_gmail_test, width=190).pack(
+            anchor="w", pady=(8, 0))
+        self._button(section, "Open Google App Passwords", lambda: webbrowser.open(APP_PASSWORD_URL),
+                     "ghost", width=220).pack(anchor="w", pady=(8, 0))
+
+        # --- delete ---
+        section = self._settings_section(
+            page, "Delete account", "Permanently deletes this account, its picture, progress, quiz "
+                                    "history and achievements. This cannot be undone.", danger=True)
+        self._field_label(section, "Type your password to confirm")
+        confirm = self._entry(section, "Password", show="•", width=420)
+        confirm.pack(anchor="w")
+        del_status = self._status_line(section)
+        self._button(section, "Delete My Account", lambda: self._delete_account(confirm, del_status),
+                     "danger", width=180).pack(anchor="w", pady=(10, 0))
+
+    def _choose_avatar(self):
+        path = filedialog.askopenfilename(
+            title="Choose a profile picture",
+            filetypes=[("Images", "*.png *.jpg *.jpeg"), ("PNG", "*.png"), ("JPEG", "*.jpg *.jpeg")])
+        if not path:
+            return
+        try:
+            image = load_avatar_source(path)
+        except ValidationError as exc:
+            self.toast(str(exc), "error", 6000)
+            return
+        self._avatar_preview_dialog(image, Path(path).name)
+
+    def _avatar_preview_dialog(self, image, original_name):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Preview profile picture")
+        dialog.configure(fg_color=C["card"])
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(padx=32, pady=28)
+        ctk.CTkLabel(body, text="Looks good?", font=self.font(18, "bold"), text_color=C["text"]).pack()
+        ctk.CTkLabel(body, text=shorten(original_name, 40), font=self.font(12),
+                     text_color=C["muted"]).pack(pady=(2, 16))
+        previews = ctk.CTkFrame(body, fg_color="transparent")
+        previews.pack()
+        for size in (140, 64, 38):
+            self._avatar(previews, size, ring=size == 140, image=image).pack(side="left", padx=8, anchor="s")
+        actions = ctk.CTkFrame(body, fg_color="transparent")
+        actions.pack(pady=(22, 0))
+
+        def save():
+            try:
+                stored = self.db.set_avatar(self.quest.user_id, image, original_name)
+            except DatabaseError as exc:
+                self.toast(f"Could not save the picture: {exc}", "error", 6000)
+                return
+            dialog.destroy()
+            self._avatar_cache.clear()
+            self.quest.avatar_path = stored
+            self._rebuild_after_account_change("Profile picture updated.")
+
+        self._button(actions, "Cancel", dialog.destroy, "ghost", width=110).pack(side="left", padx=6)
+        self._button(actions, "Save Picture", save, width=140).pack(side="left", padx=6)
+        dialog.after(50, dialog.grab_set)
+        dialog.focus_force()
+
+    def _remove_avatar(self):
+        if not messagebox.askyesno("Remove picture", "Remove your profile picture?"):
+            return
+        try:
+            self.db.remove_avatar(self.quest.user_id)
+        except DatabaseError as exc:
+            self.toast(f"Could not remove the picture: {exc}", "error", 6000)
+            return
+        self._avatar_cache.clear()
+        self.quest.avatar_path = None
+        self._rebuild_after_account_change("Profile picture removed.")
+
+    def _save_profile(self, fields, status):
+        try:
+            full_name = clean_full_name(fields["full_name"].get())
+            username = clean_username(fields["username"].get())
+            email = clean_email(fields["email"].get())
+            bio = clean_bio(fields["bio"].get("1.0", "end"))
+            self.db.update_profile(self.quest.user_id, full_name, username, email, bio)
+        except ValidationError as exc:
+            status.configure(text=str(exc), text_color=C["error"])
+            return
+        except DatabaseError as exc:
+            status.configure(text=f"Could not save: {exc}", text_color=C["error"])
+            return
+        quest = self.quest
+        if email.lower() != quest.email.lower():
+            quest.last_error = None
+        quest.player, quest.username, quest.email, quest.bio = full_name, username, email, bio
+        self._pdf_cache = None
+        self._rebuild_after_account_change("Profile saved.")
+
+    def _change_password(self, entries, status):
+        current, new, confirm = (entries[key].get() for key in ("current", "new", "confirm"))
+        try:
+            check_password_strength(new)
+            if new != confirm:
+                raise ValidationError("The new passwords do not match.")
+            if new == current:
+                raise ValidationError("The new password must be different from the current one.")
+            changed = self.db.change_password(self.quest.user_id, current, new)
+        except ValidationError as exc:
+            status.configure(text=str(exc), text_color=C["error"])
+            return
+        except DatabaseError as exc:
+            status.configure(text=f"Could not update the password: {exc}", text_color=C["error"])
+            return
+        if not changed:
+            status.configure(text="Your current password is incorrect.", text_color=C["error"])
+            return
+        for entry in entries.values():
+            entry.delete(0, "end")
+        status.configure(text="✓ Password updated.", text_color=C["success"])
+        self.toast("Password updated.", "success")
+
+    def _delete_account(self, entry, status):
+        password = entry.get()
+        if not password:
+            status.configure(text="Enter your password to confirm.")
+            return
+        if not messagebox.askyesno("Delete account",
+                                   "This permanently deletes your account and ALL saved progress.\n\n"
+                                   "Are you absolutely sure?", icon="warning"):
+            return
+        try:
+            deleted = self.db.delete_user(self.quest.user_id, password)
+        except DatabaseError as exc:
+            status.configure(text=f"Could not delete the account: {exc}")
+            return
+        if not deleted:
+            status.configure(text="That password is incorrect.")
+            return
+        self._end_session()
+        self.toast("Your account and all of its data were deleted.", "info")
+
+    def _rebuild_after_account_change(self, message):
+        """Rebuild the shell so the sidebar card, avatars and names update everywhere."""
+        key = self.current_key
+        self.build_shell()
+        {"profile": self.show_profile}.get(key, self.show_settings)()
+        self.toast(message, "success")
+
+    # ---------------------------------------------------------------
+    #  Log out
+    # ---------------------------------------------------------------
+
+    def logout(self):
+        if self.sending:
+            if not messagebox.askyesno("Email still sending",
+                                       "Your certificate is still being sent. Log out anyway?"):
+                return
+        elif not messagebox.askyesno("Log out", "Log out of Python Journey? Your progress is saved."):
+            return
+        self._sync_state(silent=True)
+        name = self.quest.player
+        self._end_session()
+        self.toast(f"Logged out. See you soon, {name}!", "info")
+
+    def _end_session(self):
+        self.quest = QuestState()
+        self._pdf_cache = None
+        self._avatar_cache.clear()
+        self.current_key = None
+        self.cert_actions = None
+        self.show_welcome()
+
+    # ---------------------------------------------------------------
+    #  Exit
+    # ---------------------------------------------------------------
+
+    def on_exit(self):
+        if self.sending:
+            if not messagebox.askyesno("Email still sending",
+                                       "Your certificate is still being sent. Exit anyway?"):
+                return
+        elif not messagebox.askyesno("Exit Python Journey", "Are you sure you want to exit?"):
+            return
+        if self.quest.player:
+            messagebox.showinfo("Goodbye",
+                                f"Goodbye, {self.quest.player}! You passed {self.quest.passed} of 7 "
+                                f"lessons. Rank: {self.quest.rank}\n\nYour progress is saved.")
+        self._sync_state(silent=True)
+        self.db.close()
+        if self._temp_preview:
+            try:
+                os.remove(self._temp_preview)
+            except OSError:
+                pass
+        self.destroy()
+
+
+def main():
+    app = PythonJourneyApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
